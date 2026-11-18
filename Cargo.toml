@@ -1,0 +1,14 @@
+[package]
+name = "dywe-ablation-sim"
+version = "0.1.0"
+edition = "2021"
+description = "Dywe Microstructural Ablation Backtest: Rust CLOB + IBTE BLS12-381 + Cancel-Header Priority"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[dependencies]
+# Zero external dependencies required: pure Rust std implementation for deterministic fixed-point speed
