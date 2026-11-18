@@ -73,3 +73,15 @@ Run the following command from the repository root to fetch the exact public arc
 
 ```bash
 cd data && for sym in BTCUSDT ETHUSDT; do for d in 10 11 12 13 14 15 16; do for t in aggTrades trades bookDepth; do curl -s -fLO "[https://data.binance.vision/data/futures/um/daily/$](https://data.binance.vision/data/futures/um/daily/$){t}/${sym}/${sym}-${t}-2026-11-${d}.zip" && echo "OK: ${sym}-${t}-2026-11-${d}"; done; done; done && unzip -oq "*.zip" && rm -f *.zip && cd ..
+
+### Step 2: Run the Release Benchmark (`cargo run --release`)
+Compile and execute the deterministic fixed-point simulation in release mode:
+
+```bash
+cargo run --release
+
+### Step 3: Inspect the Interactive Visual Report
+Open the generated HTML report in your browser to inspect the Markout Decay curves (0ms → 5000ms), Equilibrium Spread vs. Net MM ROE charts, and full regime metrics:
+
+```bash
+open ablation_report.html
