@@ -1176,131 +1176,189 @@ fn generate_html_report(
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <style>
         :root {{
-            --bg-primary: #0b132b;
-            --bg-card: #131d3b;
-            --bg-card-alt: #1c2541;
-            --border-color: #2b3a67;
+            --bg-primary: #060913;
+            --bg-card: #0d1323;
+            --bg-card-alt: #131c31;
+            --border-color: #1e293b;
+            --border-highlight: rgba(194, 138, 255, 0.35);
             --text-main: #f8fafc;
             --text-muted: #94a3b8;
-            --accent-cyan: #00f5d4;
-            --accent-blue: #3a86ff;
-            --accent-amber: #ffbe0b;
-            --accent-red: #ff006e;
+            --accent-purple: #c28aff;
+            --accent-blue: #38bdf8;
+            --accent-amber: #f59e0b;
+            --accent-red: #f43f5e;
         }}
         * {{ box-sizing: border-box; margin: 0; padding: 0; }}
         body {{
             background-color: var(--bg-primary);
+            background-image: radial-gradient(circle at 50% 0%, rgba(194, 138, 255, 0.06) 0%, transparent 55%);
             color: var(--text-main);
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             line-height: 1.5;
-            padding: 32px 40px;
+            padding: 28px 40px 44px 40px;
         }}
         .container {{
-            max-width: 1480px;
+            max-width: 1440px;
             margin: 0 auto;
+        }}
+        .top-bar {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 18px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }}
+        .brand-pill {{
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--accent-purple);
+            background: rgba(194, 138, 255, 0.08);
+            border: 1px solid var(--border-highlight);
+            padding: 5px 12px;
+            border-radius: 999px;
+            font-weight: 600;
+        }}
+        .brand-dot {{
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: var(--accent-purple);
+            box-shadow: 0 0 8px var(--accent-purple);
+        }}
+        .engine-tag {{
+            color: var(--text-muted);
         }}
         header {{
             display: flex;
             justify-content: space-between;
             align-items: flex-end;
+            gap: 24px;
             border-bottom: 1px solid var(--border-color);
-            padding-bottom: 20px;
-            margin-bottom: 28px;
+            padding-bottom: 22px;
+            margin-bottom: 26px;
         }}
         .title-group h1 {{
-            font-size: 25px;
+            font-size: 26px;
             font-weight: 700;
             letter-spacing: -0.02em;
             color: #ffffff;
         }}
         .title-group p {{
             color: var(--text-muted);
-            font-size: 13px;
+            font-size: 13.5px;
             margin-top: 6px;
         }}
         .meta-badges {{
             display: flex;
-            gap: 10px;
+            gap: 8px;
             flex-wrap: wrap;
+            justify-content: flex-end;
         }}
         .badge {{
             background: var(--bg-card-alt);
             border: 1px solid var(--border-color);
-            padding: 6px 12px;
+            padding: 5px 11px;
             border-radius: 6px;
-            font-size: 12px;
+            font-size: 11.5px;
             font-family: 'JetBrains Mono', monospace;
-            color: var(--accent-cyan);
+            color: #cbd5e1;
+        }}
+        .badge strong {{
+            color: var(--accent-purple);
+            font-weight: 600;
         }}
         .kpi-grid {{
             display: grid;
             grid-template-columns: repeat(4, 1fr);
             gap: 18px;
-            margin-bottom: 28px;
+            margin-bottom: 24px;
         }}
         .kpi-card {{
-            background: var(--bg-card);
+            background: linear-gradient(180deg, rgba(19, 28, 49, 0.9) 0%, var(--bg-card) 100%);
             border: 1px solid var(--border-color);
-            border-radius: 10px;
-            padding: 20px;
+            border-top: 1px solid rgba(194, 138, 255, 0.25);
+            border-radius: 12px;
+            padding: 20px 22px;
         }}
         .kpi-card .label {{
             font-size: 11px;
+            font-weight: 600;
             text-transform: uppercase;
             letter-spacing: 0.06em;
             color: var(--text-muted);
         }}
         .kpi-card .value {{
-            font-size: 26px;
+            font-size: 28px;
             font-weight: 700;
-            color: var(--accent-cyan);
-            margin: 8px 0 4px 0;
+            color: var(--accent-purple);
+            margin: 8px 0 8px 0;
             font-family: 'JetBrains Mono', monospace;
+            letter-spacing: -0.02em;
         }}
-        .kpi-card .sub {{
-            font-size: 12px;
-            color: var(--text-muted);
+        .kpi-pill {{
+            display: inline-block;
+            font-size: 11.5px;
+            font-family: 'JetBrains Mono', monospace;
+            color: #e2e8f0;
+            background: rgba(56, 189, 248, 0.1);
+            border: 1px solid rgba(56, 189, 248, 0.25);
+            padding: 3px 8px;
+            border-radius: 5px;
         }}
-        .charts-grid-3 {{
+        .charts-row-top {{
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
+            grid-template-columns: repeat(2, 1fr);
             gap: 20px;
-            margin-bottom: 28px;
+            margin-bottom: 20px;
+        }}
+        .charts-row-bottom {{
+            display: grid;
+            grid-template-columns: 1fr;
+            margin-bottom: 26px;
         }}
         .chart-card {{
             background: var(--bg-card);
             border: 1px solid var(--border-color);
-            border-radius: 10px;
-            padding: 20px;
+            border-radius: 12px;
+            padding: 22px 24px;
         }}
         .chart-card h2 {{
-            font-size: 15px;
+            font-size: 15.5px;
             font-weight: 600;
             margin-bottom: 4px;
             color: #ffffff;
         }}
         .chart-card p {{
-            font-size: 11px;
+            font-size: 12px;
             color: var(--text-muted);
-            margin-bottom: 14px;
+            margin-bottom: 16px;
         }}
         .chart-wrapper {{
             position: relative;
-            height: 310px;
+            height: 340px;
+            width: 100%;
+        }}
+        .chart-wrapper-wide {{
+            position: relative;
+            height: 360px;
             width: 100%;
         }}
         .table-card {{
             background: var(--bg-card);
             border: 1px solid var(--border-color);
-            border-radius: 10px;
+            border-radius: 12px;
             padding: 24px;
-            margin-bottom: 24px;
             overflow-x: auto;
         }}
         .table-card h2 {{
             font-size: 16px;
             font-weight: 600;
-            margin-bottom: 14px;
+            margin-bottom: 16px;
+            color: #ffffff;
         }}
         table {{
             width: 100%;
@@ -1308,10 +1366,11 @@ fn generate_html_report(
             font-size: 12.5px;
         }}
         th, td {{
-            padding: 11px 12px;
+            padding: 12px 12px;
             text-align: right;
             border-bottom: 1px solid var(--border-color);
             font-family: 'JetBrains Mono', monospace;
+            white-space: nowrap;
         }}
         th:first-child, td:first-child {{
             text-align: left;
@@ -1326,33 +1385,53 @@ fn generate_html_report(
             background: var(--bg-card-alt);
         }}
         tr.highlight-row {{
-            background: rgba(0, 245, 212, 0.08);
+            background: rgba(194, 138, 255, 0.08);
         }}
         tr.highlight-row td {{
-            color: var(--accent-cyan);
+            color: var(--accent-purple);
             font-weight: 600;
         }}
         .footnote {{
             margin-top: 16px;
+            padding-top: 14px;
+            border-top: 1px solid var(--border-color);
             font-size: 12px;
             color: var(--text-muted);
             display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }}
+        .footnote-row {{
+            display: flex;
             justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 12px;
+        }}
+        code {{
+            color: var(--accent-purple);
+            background: var(--bg-card-alt);
+            padding: 2px 6px;
+            border-radius: 4px;
         }}
     </style>
 </head>
 <body>
 <div class="container">
+    <div class="top-bar">
+        <span class="brand-pill"><span class="brand-dot"></span>DYWE PROTOCOL // QUANTITATIVE RESEARCH</span>
+        <span class="engine-tag">DETERMINISTIC FIXED-POINT ENGINE (i64 / i128, SCALE 1e8)</span>
+    </div>
+
     <header>
         <div class="title-group">
             <h1>DYWE EXCHANGE — 7-DAY MULTI-PAIR MICROSTRUCTURAL ABLATION STUDY</h1>
             <p>Endogenous Orderbook Replay on Binance Futures (BTCUSDT &amp; ETHUSDT, Nov 10–16, 2026) | Real Tick, AggTrade &amp; L2 BookDepth Elasticity</p>
         </div>
         <div class="meta-badges">
-            <span class="badge">Window: 2026-11-10..16 (14 Pair-Days)</span>
-            <span class="badge">L1 Ticks: {total_ticks}</span>
-            <span class="badge">AggTrades: {total_agg}</span>
-            <span class="badge">Depth Snaps: {total_depth_snaps}</span>
+            <span class="badge">Window: <strong>2026-11-10..16</strong> (14 Pair-Days)</span>
+            <span class="badge">L1 Ticks: <strong>{total_ticks}</strong></span>
+            <span class="badge">AggTrades: <strong>{total_agg}</strong></span>
+            <span class="badge">Depth Snaps: <strong>{total_depth_snaps}</strong></span>
             <span class="badge">{rustc_ver}</span>
         </div>
     </header>
@@ -1361,26 +1440,26 @@ fn generate_html_report(
         <div class="kpi-card">
             <div class="label">Consolidated Equilibrium Spread</div>
             <div class="value">{cd_spread} bps</div>
-            <div class="sub">vs {cb_spread} bps (Hyperliquid) &amp; {cc_spread} bps (DFBA 100ms)</div>
+            <span class="kpi-pill">vs {cb_spread} bps (HL) &amp; {cc_spread} bps (DFBA)</span>
         </div>
         <div class="kpi-card">
             <div class="label">Consolidated Net MM ROE ($10M)</div>
-            <div class="value">{cd_roe}%</div>
-            <div class="sub">+{delta_d_vs_b} pp vs Hyperliquid | +{delta_d_vs_c} pp vs DFBA</div>
+            <div class="value">+{cd_roe}%</div>
+            <span class="kpi-pill">+{delta_d_vs_b} pp vs Hyperliquid | +{delta_d_vs_c} pp vs DFBA</span>
         </div>
         <div class="kpi-card">
             <div class="label">Taker &amp; Copy-Vault MEV Savings</div>
             <div class="value">+{cd_mev_save} bps</div>
-            <div class="sub">{cb_mev} sandwiches eliminated vs Regime B</div>
+            <span class="kpi-pill">0 / {cb_mev} Sandwiches Eliminated</span>
         </div>
         <div class="kpi-card">
-            <div class="label">Rust CLOB + IBTE Core Overhead</div>
+            <div class="label">Rust CLOB Core Latency</div>
             <div class="value">{cd_p50} &mu;s / {cd_p99} &mu;s</div>
-            <div class="sub">p50 / p99 per batch | LULD &plusmn;2.5% triggers: {cd_luld}</div>
+            <span class="kpi-pill">p50 / p99 per batch | LULD &plusmn;2.5%: {cd_luld}</span>
         </div>
     </div>
 
-    <div class="charts-grid-3">
+    <div class="charts-row-top">
         <div class="chart-card">
             <h2>Chart 1A: BTCUSDT 7-Day Markout Decay (bps)</h2>
             <p>Volume-weighted post-trade MM markout across 0ms &rarr; 5000ms ($0.10 tick)</p>
@@ -1395,10 +1474,13 @@ fn generate_html_report(
                 <canvas id="ethMarkoutChart"></canvas>
             </div>
         </div>
+    </div>
+
+    <div class="charts-row-bottom">
         <div class="chart-card">
-            <h2>Chart 2: Consolidated Spread (bps) vs Net MM ROE (%)</h2>
-            <p>7-Day aggregated breakeven spread &amp; annualized ROE ($10M inv., $150M/day)</p>
-            <div class="chart-wrapper">
+            <h2>Chart 2: Consolidated Equilibrium Spread (bps) vs. Annualized Net MM ROE (%)</h2>
+            <p>7-Day aggregated breakeven spread (bars, left axis) overlaid with annualized Net MM ROE on $10M inventory at $150M/day turnover (line, right axis)</p>
+            <div class="chart-wrapper-wide">
                 <canvas id="spreadRoeChart"></canvas>
             </div>
         </div>
@@ -1453,7 +1535,7 @@ fn generate_html_report(
                     <td>{cb_m5000} bp</td>
                     <td>{cb_lvr} bp</td>
                     <td>{cb_spread} bp</td>
-                    <td>{cb_roe}%</td>
+                    <td>+{cb_roe}%</td>
                     <td>+{delta_d_vs_b} pp</td>
                     <td>{cb_slip} bp</td>
                     <td>0.00 bp</td>
@@ -1470,7 +1552,7 @@ fn generate_html_report(
                     <td>{cc_m5000} bp</td>
                     <td>{cc_lvr} bp</td>
                     <td>{cc_spread} bp</td>
-                    <td>{cc_roe}%</td>
+                    <td>+{cc_roe}%</td>
                     <td>+{delta_d_vs_c} pp</td>
                     <td>{cc_slip} bp</td>
                     <td>{cc_save} bp</td>
@@ -1480,14 +1562,14 @@ fn generate_html_report(
                 </tr>
                 <tr class="highlight-row">
                     <td>{cd_name}</td>
-                    <td>{cd_m0} bp</td>
-                    <td>{cd_m100} bp</td>
-                    <td>{cd_m500} bp</td>
-                    <td>{cd_m1000} bp</td>
-                    <td>{cd_m5000} bp</td>
+                    <td>+{cd_m0} bp</td>
+                    <td>+{cd_m100} bp</td>
+                    <td>+{cd_m500} bp</td>
+                    <td>+{cd_m1000} bp</td>
+                    <td>+{cd_m5000} bp</td>
                     <td>{cd_lvr} bp</td>
                     <td>{cd_spread} bp</td>
-                    <td>{cd_roe}%</td>
+                    <td>+{cd_roe}%</td>
                     <td>BASELINE</td>
                     <td>{cd_slip} bp</td>
                     <td>+{cd_mev_save} bp</td>
@@ -1498,8 +1580,13 @@ fn generate_html_report(
             </tbody>
         </table>
         <div class="footnote">
-            <span>Consolidated Replay Volume: {mm_vol} | Calibration: $10M MM Inventory @ 15x Daily Turnover ($150M/day), -0.50 bps Maker Rebate, 0.30 bps VIP Hedge OpEx</span>
-            <span>100% Endogenous Fixed-Point Core (<code>i64</code>/<code>i128</code>)</span>
+            <div class="footnote-row">
+                <span>Consolidated Replay Volume: <strong>{mm_vol}</strong> | Calibration: $10M Inventory @ 15x Daily Turnover ($150M/day), -0.50 bps Maker Rebate, 0.30 bps VIP Hedge OpEx</span>
+                <span>100% Endogenous Fixed-Point Core (<code>i64</code>/<code>i128</code>)</span>
+            </div>
+            <div class="footnote-row">
+                <span>Methodology Note: Core p50/p99 (1&mu;s / 2&mu;s) reflects pure in-memory CLOB batch matching; full BLS12-381 (5-of-7) threshold decryption adds 0.75 ms CPU / ~35 ms network RTT (benchmarked separately in Doc #16).</span>
+            </div>
         </div>
     </div>
 </div>
@@ -1519,34 +1606,39 @@ fn generate_html_report(
                     {{
                         label: 'Regime D: Dywe (IBTE + Cancel-Prio)',
                         data: dD,
-                        borderColor: '#00f5d4',
+                        borderColor: '#c28aff',
+                        backgroundColor: 'rgba(194, 138, 255, 0.12)',
                         borderWidth: 3,
-                        pointRadius: 4,
+                        pointRadius: 4.5,
+                        pointBackgroundColor: '#c28aff',
                         tension: 0.25
                     }},
                     {{
                         label: 'Regime B: Cancel-Prio (Hyperliquid)',
                         data: dB,
-                        borderColor: '#3a86ff',
+                        borderColor: '#38bdf8',
                         borderWidth: 2,
                         borderDash: [5, 5],
-                        pointRadius: 3,
+                        pointRadius: 3.5,
+                        pointBackgroundColor: '#38bdf8',
                         tension: 0.25
                     }},
                     {{
                         label: 'Regime C: DFBA (100ms)',
                         data: dC,
-                        borderColor: '#ffbe0b',
+                        borderColor: '#f59e0b',
                         borderWidth: 2,
-                        pointRadius: 3,
+                        pointRadius: 3.5,
+                        pointBackgroundColor: '#f59e0b',
                         tension: 0.25
                     }},
                     {{
                         label: 'Regime A: Transparent FIFO',
                         data: dA,
-                        borderColor: '#ff006e',
+                        borderColor: '#f43f5e',
                         borderWidth: 2,
-                        pointRadius: 3,
+                        pointRadius: 3.5,
+                        pointBackgroundColor: '#f43f5e',
                         tension: 0.25
                     }}
                 ]
@@ -1554,10 +1646,25 @@ fn generate_html_report(
             options: {{
                 responsive: true,
                 maintainAspectRatio: false,
-                plugins: {{ legend: {{ position: 'bottom', labels: {{ boxWidth: 12, font: {{ size: 11 }} }} }} }},
+                plugins: {{
+                    legend: {{ position: 'bottom', labels: {{ boxWidth: 12, padding: 14, font: {{ size: 11.5 }} }} }},
+                    tooltip: {{
+                        backgroundColor: '#0d1323',
+                        borderColor: '#1e293b',
+                        borderWidth: 1,
+                        callbacks: {{
+                            label: (ctx) => `${{ctx.dataset.label}}: ${{ctx.parsed.y >= 0 ? '+' : ''}}${{ctx.parsed.y.toFixed(2)}} bps`
+                        }}
+                    }}
+                }},
                 scales: {{
-                    y: {{ grid: {{ color: '#1c2541' }}, title: {{ display: true, text: 'Markout (bps)' }} }},
-                    x: {{ grid: {{ color: '#1c2541' }} }}
+                    y: {{
+                        grid: {{ color: '#1e293b' }},
+                        title: {{ display: true, text: 'Volume-Weighted Markout (bps)' }}
+                    }},
+                    x: {{
+                        grid: {{ color: '#1e293b' }}
+                    }}
                 }}
             }}
         }};
@@ -1586,35 +1693,80 @@ fn generate_html_report(
     new Chart(document.getElementById('spreadRoeChart'), {{
         type: 'bar',
         data: {{
-            labels: ['Regime A', 'Regime B', 'Regime C', 'Regime D (Dywe)'],
+            labels: ['Regime A (Transparent FIFO)', 'Regime B (Hyperliquid Cancel-Prio)', 'Regime C (DFBA 100ms)', 'Regime D (Dywe IBTE + Cancel-Prio)'],
             datasets: [
                 {{
-                    label: 'Eq. Spread (bps)',
-                    data: [{ca_spread}, {cb_spread}, {cc_spread}, {cd_spread}],
-                    backgroundColor: ['#ff006e', '#3a86ff', '#ffbe0b', '#00f5d4'],
-                    yAxisID: 'ySpread',
-                    borderRadius: 5
-                }},
-                {{
-                    label: 'Net MM ROE (%)',
+                    label: 'Annualized Net MM ROE (%) — Right Axis',
                     data: [{ca_roe}, {cb_roe}, {cc_roe}, {cd_roe}],
                     type: 'line',
+                    order: 0,
                     borderColor: '#ffffff',
-                    backgroundColor: '#00f5d4',
+                    backgroundColor: '#c28aff',
                     borderWidth: 3,
-                    pointRadius: 5,
+                    pointRadius: 7,
+                    pointHoverRadius: 9,
+                    pointBackgroundColor: ['#f43f5e', '#38bdf8', '#f59e0b', '#c28aff'],
+                    pointBorderColor: '#060913',
+                    pointBorderWidth: 2,
+                    tension: 0.2,
                     yAxisID: 'yRoe'
+                }},
+                {{
+                    label: 'Equilibrium Bid-Ask Spread (bps) — Left Axis',
+                    data: [{ca_spread}, {cb_spread}, {cc_spread}, {cd_spread}],
+                    order: 1,
+                    backgroundColor: [
+                        'rgba(244, 63, 94, 0.72)',
+                        'rgba(56, 189, 248, 0.72)',
+                        'rgba(245, 158, 11, 0.72)',
+                        'rgba(194, 138, 255, 0.78)'
+                    ],
+                    borderColor: ['#f43f5e', '#38bdf8', '#f59e0b', '#c28aff'],
+                    borderWidth: 1.5,
+                    barPercentage: 0.45,
+                    categoryPercentage: 0.65,
+                    yAxisID: 'ySpread',
+                    borderRadius: 6
                 }}
             ]
         }},
         options: {{
             responsive: true,
             maintainAspectRatio: false,
-            plugins: {{ legend: {{ position: 'bottom', labels: {{ boxWidth: 12, font: {{ size: 11 }} }} }} }},
+            interaction: {{ mode: 'index', intersect: false }},
+            plugins: {{
+                legend: {{ position: 'bottom', labels: {{ boxWidth: 14, padding: 16, font: {{ size: 12 }} }} }},
+                tooltip: {{
+                    backgroundColor: '#0d1323',
+                    borderColor: '#1e293b',
+                    borderWidth: 1
+                }}
+            }},
             scales: {{
-                ySpread: {{ type: 'linear', position: 'left', grid: {{ color: '#1c2541' }}, title: {{ display: true, text: 'Spread (bps)' }} }},
-                yRoe: {{ type: 'linear', position: 'right', grid: {{ drawOnChartArea: false }}, title: {{ display: true, text: 'Net ROE (%)' }} }},
-                x: {{ grid: {{ color: '#1c2541' }} }}
+                ySpread: {{
+                    type: 'linear',
+                    position: 'left',
+                    min: 0,
+                    max: 6,
+                    grid: {{ color: '#1e293b' }},
+                    title: {{ display: true, text: 'Equilibrium Spread (bps)' }}
+                }},
+                yRoe: {{
+                    type: 'linear',
+                    position: 'right',
+                    min: -45,
+                    max: 45,
+                    grid: {{
+                        drawOnChartArea: true,
+                        color: (ctx) => ctx.tick.value === 0 ? 'rgba(255, 255, 255, 0.28)' : 'transparent',
+                        lineWidth: (ctx) => ctx.tick.value === 0 ? 1.5 : 0
+                    }},
+                    title: {{ display: true, text: 'Annualized Net MM ROE (%)' }}
+                }},
+                x: {{
+                    grid: {{ color: '#1e293b' }},
+                    ticks: {{ maxRotation: 0, minRotation: 0 }}
+                }}
             }}
         }}
     }});
