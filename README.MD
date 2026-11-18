@@ -65,23 +65,31 @@ Every historical tick, taker order, and L2 orderbook depth snapshot is replayed 
 ## 5. How to Reproduce Locally
 
 ### Prerequisites
-* Rust toolchain (`rustc 1.82+` / `cargo`)
-* `curl` and `unzip` (standard on macOS / Linux)
+- Rust toolchain (`rustc 1.82+` / `cargo`)
+- `curl` and `unzip` (standard on macOS / Linux)
 
 ### Step 1: Download the 7-Day Binance Futures Dataset into `./data/`
 Run the following command from the repository root to fetch the exact public archives (`BTCUSDT` & `ETHUSDT` for `2026-11-10` through `2026-11-16`):
 
 ```bash
-cd data && for sym in BTCUSDT ETHUSDT; do for d in 10 11 12 13 14 15 16; do for t in aggTrades trades bookDepth; do curl -s -fLO "[https://data.binance.vision/data/futures/um/daily/$](https://data.binance.vision/data/futures/um/daily/$){t}/${sym}/${sym}-${t}-2026-11-${d}.zip" && echo "OK: ${sym}-${t}-2026-11-${d}"; done; done; done && unzip -oq "*.zip" && rm -f *.zip && cd ..
+cd data && for sym in BTCUSDT ETHUSDT; do for d in 10 11 12 13 14 15 16; do for t in aggTrades trades bookDepth; do curl -s -fLO "https://data.binance.vision/data/futures/um/daily/${t}/${sym}/${sym}-${t}-2026-11-${d}.zip" && echo "OK: ${sym}-${t}-2026-11-${d}"; done; done; done && unzip -oq "*.zip" && rm -f *.zip && cd ..
+```
 
 ### Step 2: Run the Release Benchmark (`cargo run --release`)
 Compile and execute the deterministic fixed-point simulation in release mode:
 
 ```bash
 cargo run --release
+```
+
+- **Execution time:** ~30–60 seconds on Apple Silicon (`M1`/`M2`/`M3`) across all **84,131,219 L1 ticks**, **26,295,897 aggTrades**, and **40,320 L2 depth snapshots**.
+- **Outputs:**
+  1. Prints the full `BTCUSDT`, `ETHUSDT`, and `CONSOLIDATED 7-DAY BENCHMARK` comparison tables directly to stdout.
+  2. Generates a self-contained interactive dashboard at **`./ablation_report.html`**.
 
 ### Step 3: Inspect the Interactive Visual Report
-Open the generated HTML report in your browser to inspect the Markout Decay curves (0ms → 5000ms), Equilibrium Spread vs. Net MM ROE charts, and full regime metrics:
+Open the generated HTML report in your browser to inspect the Markout Decay curves (`0ms → 5000ms`), Equilibrium Spread vs. Net MM ROE charts, and full regime metrics:
 
 ```bash
 open ablation_report.html
+```
