@@ -1,193 +1,62 @@
+//! dywe-ablation-sim v0.2.2 — SCENARIO-BASED CAUSAL MICROSTRUCTURE BACKTEST.
+//!
+//! Pre-flight verification:
+//!   `cargo test --release`
+//!   `cargo run --release -- --preflight-only`
+//!
+//! Separation of Empirical Measurements vs. Scenario Assumptions:
+//!   * DATA (MEASURED): Mid-price trajectory (`bookTicker` or reconstructed `trades`), actual taker
+//!     order flow (`aggTrades`), directional informed drift, and MM quote markouts across
+//!     0 ms / 100 ms / 1000 ms horizons.
+//!   * MECHANICS (SWEPT PARAMETERS): Feed/reaction/network latencies, batch window duration,
+//!     threshold decryption RTT, cancel-header priority, and uniform-price batch clearing.
+//!   * ASSUMPTIONS (SCENARIO GRID): MEV extraction (captured share of large orders >= $50k ×
+//!     per-order impact × MM loss share). Threshold encryption affects outcomes strictly through
+//!     this MEV/leakage parameter grid and post-commit decryption latency.
+
 #![allow(dead_code)]
 
+use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
-use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
-/// Fixed-point scaling constants (100% integer math in matching engine core, zero f32/f64)
-const PRICE_SCALE: i64 = 100_000_000;   // 1e8 ($90,000.00 = 9_000_000_000_000)
-const QTY_SCALE: i64 = 100_000_000;     // 1e8 (1.00000000 asset = 100_000_000)
-const BPS_SCALE: i128 = 10_000;         // 10,000 bps = 100%
-const SUB_BPS_SCALE: i128 = 1_000_000;  // 1e6 = 100 sub-bps per 1.00 bps
+// ============================================================================
+// Constants & Fixed-Point Scaling
+// ============================================================================
 
-/// Institutional VIP MM Desk Calibration
-const MM_DESK_INVENTORY_USD: i128 = 10_000_000;
-const MM_DESK_DAILY_VOLUME_USD: i128 = 150_000_000; // 15x daily turnover ($150M/day)
-const MAKER_REBATE_SUB_BPS: i128 = 50;              // -0.50 bps maker rebate (+0.50 bps revenue)
-const MM_HEDGING_OPEX_SUB_BPS: i128 = 30;           // 0.30 bps VIP inventory rebalancing cost
+const PRICE_SCALE: i64 = 100_000_000; // 1e8
+const QTY_SCALE: i64 = 100_000_000;   // 1e8
+/// 1 "sub" unit = 1e-6 relative price; 100 sub = 1.00 bps.
+const SUB: i128 = 1_000_000;
+/// Extra precision multiplier in Phase 2: value_q = sub_bps * Q.
+const Q: i128 = 1_000;
+const HORIZONS_MS: [i64; 3] = [0, 100, 1000];
+const NS_PER_MS: i64 = 1_000_000;
+/// Upper feasibility cap for equilibrium half-spread: 10.00 bps = 1000 sub.
+const S_CAP_Q: i128 = 1_000 * Q;
 
-/// LULD Circuit Breaker Threshold: +/- 2.50% move within a 50ms micro-batch
-const LULD_THRESHOLD_SUB_BPS: i128 = 25_000;        // 250.00 bps = 2.50%
+const CAPTURES_PPM: [i128; 6] = [0, 100_000, 250_000, 500_000, 750_000, 1_000_000];
+const IMPACTS_SUB: [i128; 5] = [0, 50, 100, 200, 300];
+const SHARES_PPM: [i128; 4] = [0, 250_000, 500_000, 1_000_000];
+const LEAKS_PPM: [i128; 4] = [0, 100_000, 250_000, 500_000];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Symbol {
-    BtcUsdt,
-    EthUsdt,
+macro_rules! emit {
+    ($rep:expr, $($arg:tt)*) => {{
+        let s = format!($($arg)*);
+        println!("{}", s);
+        $rep.push_str(&s);
+        $rep.push('\n');
+    }};
 }
 
-impl Symbol {
-    fn ticker(&self) -> &'static str {
-        match self {
-            Symbol::BtcUsdt => "BTCUSDT",
-            Symbol::EthUsdt => "ETHUSDT",
-        }
-    }
+// ============================================================================
+// Deterministic PRNG (SplitMix64)
+// ============================================================================
 
-    fn half_tick_1e8(&self) -> i64 {
-        match self {
-            Symbol::BtcUsdt => 5_000_000, // $0.10 tick -> $0.05 half-tick
-            Symbol::EthUsdt => 500_000,   // $0.01 tick -> $0.005 half-tick
-        }
-    }
-
-    fn default_depth_1pct_usd(&self) -> i128 {
-        match self {
-            Symbol::BtcUsdt => 18_000_000, // $18M +/-1% baseline depth
-            Symbol::EthUsdt => 9_500_000,  // $9.5M +/-1% baseline depth
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct TickRecord {
-    ts_ms: i64,
-    mid_price: i64, // Fixed-point 1e8
-    price: i64,     // Fixed-point 1e8
-    qty: i64,       // Fixed-point 1e8
-    is_buyer_maker: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct AggTradeRecord {
-    ts_ms: i64,
-    price: i64,        // Fixed-point 1e8
-    qty: i64,          // Fixed-point 1e8
-    notional_usd: i64, // Whole USD notional
-    is_buyer_maker: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct DepthSnapshot {
-    ts_ms: i64,
-    depth_1pct_usd: i128,
-    /// Endogenous price impact in sub-bps per $100,000 swept from top-of-book
-    impact_sub_bps_per_100k: i128,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Regime {
-    RegimeA, // Transparent FIFO (Baseline CLOB)
-    RegimeB, // FIFO + Cancel Priority (Hyperliquid Model)
-    RegimeC, // Discrete Batch Auction (DFBA 100ms - Jump Crypto Model)
-    RegimeD, // Dywe Architecture (IBTE BLS12-381 + Cancel Priority, 50ms micro-batch)
-}
-
-impl Regime {
-    fn name(&self) -> &'static str {
-        match self {
-            Regime::RegimeA => "Regime A: Transparent FIFO (Baseline)",
-            Regime::RegimeB => "Regime B: FIFO + Cancel Priority (Hyperliquid)",
-            Regime::RegimeC => "Regime C: Discrete Batch Auction (DFBA 100ms)",
-            Regime::RegimeD => "Regime D: Dywe (IBTE BLS12-381 + Cancel-Prio)",
-        }
-    }
-
-    fn short_code(&self) -> &'static str {
-        match self {
-            Regime::RegimeA => "Regime A (FIFO)",
-            Regime::RegimeB => "Regime B (Cancel-Prio)",
-            Regime::RegimeC => "Regime C (DFBA 100ms)",
-            Regime::RegimeD => "Regime D (Dywe IBTE)",
-        }
-    }
-
-    fn batch_window_ms(&self) -> i64 {
-        match self {
-            Regime::RegimeC => 100, // 100ms discrete uniform-price auction
-            _ => 50,                // 50ms micro-batch evaluation frame
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OrderClass {
-    MmCancel,
-    MmNewQuote,
-    LatencySniper,
-    MevFrontrun,
-    DirectionalTaker,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct BatchEvent {
-    arrival_ts_ns: i64,
-    class: OrderClass,
-    is_sell_taker: bool, // true = hits MM Bid (MM buys), false = lifts MM Ask (MM sells)
-    qty: i64,            // 1e8
-    notional_usd: i64,
-    target_quote_id: u64,
-    encrypted_payload: [u8; 32],
-}
-
-#[derive(Clone, Copy, Debug)]
-struct MmFill {
-    ts_ms: i64,
-    mm_side_sign: i128, // +1 if MM bought (Bid hit), -1 if MM sold (Ask lifted)
-    fill_price: i64,    // 1e8
-    ref_mid_t0: i64,    // 1e8
-    qty: i64,           // 1e8
-    notional_usd: i128,
-    is_toxic_sniper: bool,
-    mev_induced_adverse_sub_bps: i128,
-}
-
-#[derive(Clone, Debug, Default)]
-struct AccumulatorStats {
-    total_batches: usize,
-    mm_fills_count: usize,
-    sniper_fills_count: usize,
-    mev_sandwiched_orders: usize,
-    luld_triggers: usize,
-    total_mm_volume_usd: i128,
-    total_mm_asset_qty: i128,
-    toxic_sniper_vol_usd: i128,
-    total_taker_volume_usd: i128,
-    weighted_markout_sums: [i128; 5], // 0ms, 100ms, 500ms, 1000ms, 5000ms
-    lvr_loss_weighted_sum: i128,
-    taker_slippage_weighted_sum: i128,
-    batch_latencies_ns: Vec<u64>,
-}
-
-#[derive(Clone, Debug)]
-struct RegimeMetrics {
-    regime: Regime,
-    total_batches: usize,
-    mm_fills_count: usize,
-    sniper_fills_count: usize,
-    mev_sandwiched_orders: usize,
-    luld_triggers: usize,
-    total_mm_volume_usd: i128,
-    toxic_volume_share_sub_pct: i128,
-    total_taker_volume_usd: i128,
-    // Volume-weighted Markouts in sub-bps (100 = 1.00 bps)
-    markout_0ms_sub_bps: i128,
-    markout_100ms_sub_bps: i128,
-    markout_500ms_sub_bps: i128,
-    markout_1000ms_sub_bps: i128,
-    markout_5000ms_sub_bps: i128,
-    // Endogenous Institutional Metrics in sub-bps (100 = 1.00 bps)
-    adverse_selection_lvr_sub_bps: i128,
-    equilibrium_spread_sub_bps: i128,
-    net_mm_roe_sub_pct: i128, // 100 = 1.00% annualized ROE
-    taker_slippage_sub_bps: i128,
-    mev_savings_vs_b_sub_bps: i128,
-    p50_batch_us: u64,
-    p99_batch_us: u64,
-}
-
-/// Deterministic PRNG (SplitMix64) for reproducible microsecond arrival jitter & reaction times
 struct SplitMix64 {
     state: u64,
 }
@@ -196,7 +65,6 @@ impl SplitMix64 {
     fn new(seed: u64) -> Self {
         Self { state: seed }
     }
-
     #[inline(always)]
     fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9e3779b97f4a7c15);
@@ -205,7 +73,6 @@ impl SplitMix64 {
         z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
         z ^ (z >> 31)
     }
-
     #[inline(always)]
     fn range_i64(&mut self, min: i64, max: i64) -> i64 {
         if min >= max {
@@ -216,7 +83,993 @@ impl SplitMix64 {
     }
 }
 
-/// Fast zero-float fixed-point parser: parses "91234.56" into i64 scaled by 1e8
+// ============================================================================
+// Core Data Structures
+// ============================================================================
+
+#[derive(Clone, Copy, Debug)]
+struct Mid {
+    ts_ms: i64,
+    mid: i64, // 1e8
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Taker {
+    ts_ms: i64,
+    dir: i8, // +1 taker buys (lifts Ask), -1 taker sells (hits Bid)
+    notional_usd: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Regime {
+    /// A: Continuous transparent FIFO without batching.
+    Fifo,
+    /// B: Discrete batch window + plaintext Cancel-Header priority, transparent mempool.
+    CancelPrio,
+    /// C: Uniform-price Frequent Batch Auction (FBA), intra-window arrival order ignored.
+    UniformFba,
+    /// D: Discrete batch window + plaintext Cancel-Header priority + IBTE threshold decryption.
+    IbteCancelPrio,
+}
+
+impl Regime {
+    fn is_batch(self) -> bool {
+        !matches!(self, Regime::Fifo)
+    }
+    fn code(self) -> &'static str {
+        match self {
+            Regime::Fifo => "A",
+            Regime::CancelPrio => "B",
+            Regime::UniformFba => "C",
+            Regime::IbteCancelPrio => "D",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Cfg {
+    feed_ms: i64,          // Market data feed latency to MM
+    sniper_feed_ms: i64,   // Market data feed latency to latency arbitrageurs
+    mm_react_ms: i64,      // MM quote recomputation latency
+    sniper_react_ms: i64,  // Sniper reaction latency
+    net_ms: i64,           // Client-to-sequencer network transit
+    window_ms: i64,        // Batch window duration
+    decrypt_ms: i64,       // Post-commit threshold decryption RTT (Regime D only)
+    requote_thr_sub: i64,  // Mid shift threshold triggering MM cancel+replace (sub-bps)
+    sniper_thr_sub: i64,   // Mid shift threshold triggering sniper attempt (sub-bps)
+    sniper_clip_usd: i64,  // Fixed sniper clip size in USD (0 = snipers disabled)
+    large_usd: i64,        // Notional threshold for large/informed orders ($50,000)
+    seed: u64,
+    log: bool,
+}
+
+fn default_cfg() -> Cfg {
+    Cfg {
+        feed_ms: 5,
+        sniper_feed_ms: 5,
+        mm_react_ms: 10,
+        sniper_react_ms: 2,
+        net_ms: 30,
+        window_ms: 50,
+        decrypt_ms: 0,
+        requote_thr_sub: 150,
+        sniper_thr_sub: 200,
+        sniper_clip_usd: 25_000,
+        large_usd: 50_000,
+        seed: 0xD15E_0001,
+        log: false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Kind {
+    Cancel { target: u64 },
+    New { id: u64, reff: i64 },
+    Taker { dir: i8, notional: i64, send_ms: i64 },
+    /// `target_id` records the exact quote ID the sniper observed when firing.
+    Sniper { dir: i8, notional: i64, send_ms: i64, target_id: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Ev {
+    arr_ns: i64,
+    decision_ms: i64,
+    kind: Kind,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Quote {
+    live: bool,
+    id: u64,
+    reff: i64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TakerOrd {
+    dir: i8,
+    notional: i64,
+    send_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct FillLog {
+    clear_ms: i64,
+    kind: u8, // 0 = taker fill, 1 = true stale sniper hit, 2 = FBA net fill, 3 = late sniper filled on fresh quote
+    ref_mid: i64,
+    sign: i8,
+    notional: i64,
+}
+
+// ============================================================================
+// Additive Accumulator (Summable across blocks, days, pairs, and bootstrap draws)
+// ============================================================================
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Agg {
+    // Total Market Maker side (signed markout drifts in sub-bps, notional-weighted)
+    mm_n: i128,
+    mm_w: [i128; 3],
+    // Cohort-level MM volume & 1s markout decomposition (Invariant: mm_n == mm_taker_n + mm_sniper_stale_n + mm_sniper_late_n)
+    mm_taker_n: i128,
+    mm_taker_w1s: i128,
+    mm_sniper_stale_n: i128,
+    mm_sniper_stale_w1s: i128,
+    mm_sniper_late_n: i128,
+    mm_sniper_late_w1s: i128,
+
+    mm_large_n: i128,     // MM volume matched against large taker orders (>= large_usd)
+    mm_large_exp_n: i128, // Subset of mm_large_n in batches containing an exposed Cancel-Header
+    mm_fills: i64,
+    sniper_hit: i64,        // True stale-quote snipes (target_id == active proc.id)
+    sniper_late_fresh: i64, // Sniper arrived after quote updated (filled on fresh quote)
+    sniper_missed: i64,     // Sniper arrived while book was in cancel-gap (quote not live)
+
+    // Taker side
+    tk_n: i128,
+    tk_scoef_w: i128,    // sum(n * s_coeff): effective half-spread multiplier paid by taker
+    tk_stale_w: i128,    // sum(n * dir * (ref - mid_clear)): quote staleness gain/loss
+    tk_wait_all_w: i128, // sum(n * dir * (mid_clear - mid_send)): total wait drift across all takers
+    tk_large_n: i128,
+    tk_large_exp_n: i128,
+    tk_inf_n: i128,      // Informed cohort (notional >= large_usd)
+    tk_inf_wait_w: i128, // Wait drift specifically on informed/large flow
+    tk_fills: i64,
+    batches: i64,
+    pending_dropped: i64,
+}
+
+impl Agg {
+    fn merge(&mut self, o: &Agg) {
+        self.mm_n += o.mm_n;
+        for i in 0..3 {
+            self.mm_w[i] += o.mm_w[i];
+        }
+        self.mm_taker_n += o.mm_taker_n;
+        self.mm_taker_w1s += o.mm_taker_w1s;
+        self.mm_sniper_stale_n += o.mm_sniper_stale_n;
+        self.mm_sniper_stale_w1s += o.mm_sniper_stale_w1s;
+        self.mm_sniper_late_n += o.mm_sniper_late_n;
+        self.mm_sniper_late_w1s += o.mm_sniper_late_w1s;
+
+        self.mm_large_n += o.mm_large_n;
+        self.mm_large_exp_n += o.mm_large_exp_n;
+        self.mm_fills += o.mm_fills;
+        self.sniper_hit += o.sniper_hit;
+        self.sniper_late_fresh += o.sniper_late_fresh;
+        self.sniper_missed += o.sniper_missed;
+        self.tk_n += o.tk_n;
+        self.tk_scoef_w += o.tk_scoef_w;
+        self.tk_stale_w += o.tk_stale_w;
+        self.tk_wait_all_w += o.tk_wait_all_w;
+        self.tk_large_n += o.tk_large_n;
+        self.tk_large_exp_n += o.tk_large_exp_n;
+        self.tk_inf_n += o.tk_inf_n;
+        self.tk_inf_wait_w += o.tk_inf_wait_w;
+        self.tk_fills += o.tk_fills;
+        self.batches += o.batches;
+        self.pending_dropped += o.pending_dropped;
+    }
+}
+
+fn total(blocks: &[Agg]) -> Agg {
+    let mut t = Agg::default();
+    for b in blocks {
+        t.merge(b);
+    }
+    t
+}
+
+// ============================================================================
+// Price Lookup Helpers
+// ============================================================================
+
+#[inline(always)]
+fn mid_at(mids: &[Mid], t_ms: i64) -> i64 {
+    let idx = mids.partition_point(|m| m.ts_ms <= t_ms);
+    if idx == 0 {
+        mids[0].mid
+    } else {
+        mids[idx - 1].mid
+    }
+}
+
+#[inline(always)]
+fn rel_sub(a: i64, base: i64) -> i64 {
+    (((a - base) as i128) * SUB / (base.max(1) as i128)) as i64
+}
+
+// ============================================================================
+// Phase 1: Causal Event Generation (MM Quotes & Taker Flow)
+// ============================================================================
+
+fn gen_mm_events(mids: &[Mid], cfg: &Cfg) -> Vec<Ev> {
+    let mut out: Vec<Ev> = Vec::new();
+    if mids.is_empty() {
+        return out;
+    }
+    let mut rng = SplitMix64::new(cfg.seed ^ 0x4D4D);
+    let mut intended_ref = mids[0].mid;
+    let mut quote_id: u64 = 0;
+    let mut busy_until_ms: i64 = i64::MIN;
+    for m in mids {
+        let seen_ms = m.ts_ms + cfg.feed_ms;
+        if seen_ms < busy_until_ms {
+            continue;
+        }
+        if rel_sub(m.mid, intended_ref).abs() >= cfg.requote_thr_sub {
+            let decision_ms = seen_ms + cfg.mm_react_ms;
+            let new_ref = mid_at(mids, decision_ms - cfg.feed_ms);
+            let jitter = rng.range_i64(0, 500_000);
+            let arr = (decision_ms + cfg.net_ms) * NS_PER_MS + jitter;
+            out.push(Ev {
+                arr_ns: arr,
+                decision_ms,
+                kind: Kind::Cancel { target: quote_id },
+            });
+            quote_id += 1;
+            out.push(Ev {
+                arr_ns: arr + 50_000,
+                decision_ms,
+                kind: Kind::New {
+                    id: quote_id,
+                    reff: new_ref,
+                },
+            });
+            intended_ref = new_ref;
+            busy_until_ms = decision_ms;
+        }
+    }
+    out.sort_by_key(|e| e.arr_ns);
+    out
+}
+
+fn gen_taker_events(takers: &[Taker], cfg: &Cfg) -> Vec<Ev> {
+    let mut rng = SplitMix64::new(cfg.seed ^ 0x544B);
+    let mut v: Vec<Ev> = Vec::with_capacity(takers.len());
+    for t in takers {
+        let jitter = rng.range_i64(0, 900_000);
+        v.push(Ev {
+            arr_ns: (t.ts_ms + cfg.net_ms) * NS_PER_MS + jitter,
+            decision_ms: t.ts_ms,
+            kind: Kind::Taker {
+                dir: t.dir,
+                notional: t.notional_usd.max(1),
+                send_ms: t.ts_ms,
+            },
+        });
+    }
+    v.sort_by_key(|e| e.arr_ns);
+    v
+}
+
+// ============================================================================
+// Phase 1: Matching & Execution Engine
+// ============================================================================
+
+struct Sim<'a> {
+    mids: &'a [Mid],
+    regime: Regime,
+    cfg: Cfg,
+    week_start_ms: i64,
+    block_ms: i64,
+    agg: Vec<Agg>,
+    proc: Quote,    // Internal matching engine quote state
+    visible: Quote, // Publicly visible quote state observed by snipers
+    pending: Vec<TakerOrd>,
+    tomb: HashSet<u64>,
+    sniper_inflight: bool,
+    last_sniped_quote_id: Option<u64>,
+    log: Vec<FillLog>,
+}
+
+struct SimOut {
+    agg: Vec<Agg>,
+    log: Vec<FillLog>,
+}
+
+impl<'a> Sim<'a> {
+    fn block_of(&self, ms: i64) -> usize {
+        let n = self.agg.len() as i64;
+        let b = ((ms - self.week_start_ms).max(0)) / self.block_ms;
+        b.min(n - 1) as usize
+    }
+
+    fn bump_missed(&mut self, ms: i64) {
+        let b = self.block_of(ms);
+        self.agg[b].sniper_missed += 1;
+    }
+
+    fn bump_hit(&mut self, ms: i64) {
+        let b = self.block_of(ms);
+        self.agg[b].sniper_hit += 1;
+    }
+
+    fn bump_batch(&mut self, ms: i64) {
+        let b = self.block_of(ms);
+        self.agg[b].batches += 1;
+    }
+
+    /// `sniper_mode`: 0 = normal taker, 1 = true stale sniper hit, 2 = late sniper filled on fresh quote.
+    fn rec_mm(
+        &mut self,
+        notional: i64,
+        mm_sign: i8,
+        reff: i64,
+        clear_ms: i64,
+        sniper_mode: u8,
+        large_n: i128,
+        exposed: bool,
+    ) {
+        let n = notional.max(1) as i128;
+        let mut d = [0i64; 3];
+        for (i, h) in HORIZONS_MS.iter().enumerate() {
+            let mf = mid_at(self.mids, clear_ms + *h);
+            d[i] = (mm_sign as i64) * rel_sub(mf, reff);
+        }
+        let w1s = n * (d[2] as i128);
+        let b = self.block_of(clear_ms);
+        {
+            let a = &mut self.agg[b];
+            a.mm_n += n;
+            for i in 0..3 {
+                a.mm_w[i] += n * (d[i] as i128);
+            }
+            a.mm_large_n += large_n;
+            if exposed {
+                a.mm_large_exp_n += large_n;
+            }
+            a.mm_fills += 1;
+
+            match sniper_mode {
+                1 => {
+                    a.mm_sniper_stale_n += n;
+                    a.mm_sniper_stale_w1s += w1s;
+                    a.sniper_hit += 1;
+                }
+                2 => {
+                    a.mm_sniper_late_n += n;
+                    a.mm_sniper_late_w1s += w1s;
+                    a.sniper_late_fresh += 1;
+                }
+                _ => {
+                    a.mm_taker_n += n;
+                    a.mm_taker_w1s += w1s;
+                }
+            }
+        }
+        if self.cfg.log {
+            self.log.push(FillLog {
+                clear_ms,
+                kind: if sniper_mode == 1 {
+                    1
+                } else if sniper_mode == 2 {
+                    3
+                } else {
+                    0
+                },
+                ref_mid: reff,
+                sign: mm_sign,
+                notional,
+            });
+        }
+    }
+
+    fn rec_taker(&mut self, t: &TakerOrd, reff: i64, clear_ms: i64, s_coeff: i32, exposed: bool) {
+        let n = t.notional.max(1) as i128;
+        let mid_clear = mid_at(self.mids, clear_ms);
+        let mid_send = mid_at(self.mids, t.send_ms);
+        let stale = (t.dir as i64) * rel_sub(reff, mid_clear);
+        let wait = (t.dir as i64) * rel_sub(mid_clear, mid_send);
+        let large = t.notional >= self.cfg.large_usd;
+        let b = self.block_of(clear_ms);
+        let a = &mut self.agg[b];
+        a.tk_n += n;
+        a.tk_scoef_w += n * (s_coeff as i128);
+        a.tk_stale_w += n * (stale as i128);
+        a.tk_wait_all_w += n * (wait as i128);
+        a.tk_fills += 1;
+        if large {
+            a.tk_large_n += n;
+            if exposed {
+                a.tk_large_exp_n += n;
+            }
+            a.tk_inf_n += n;
+            a.tk_inf_wait_w += n * (wait as i128);
+        }
+    }
+
+    fn exec_taker(&mut self, t: &TakerOrd, clear_ms: i64, exposed: bool) {
+        let reff = self.proc.reff;
+        let large_n = if t.notional >= self.cfg.large_usd {
+            t.notional.max(1) as i128
+        } else {
+            0
+        };
+        self.rec_mm(t.notional, -t.dir, reff, clear_ms, 0, large_n, exposed);
+        self.rec_taker(t, reff, clear_ms, 1, exposed);
+    }
+
+    fn exec_sniper(&mut self, dir: i8, notional: i64, target_id: u64, clear_ms: i64, exposed: bool) {
+        let reff = self.proc.reff;
+        // True stale snipe occurs ONLY if the targeted quote ID is still resting un-updated!
+        // If MM already updated to a newer quote ID, the late sniper order fills as normal flow on fresh quote.
+        let is_true_stale_hit = self.proc.id == target_id;
+        let mode = if is_true_stale_hit { 1 } else { 2 };
+        self.rec_mm(notional, -dir, reff, clear_ms, mode, 0, exposed);
+    }
+
+    fn flush_pending(&mut self, clear_ms: i64, exposed: bool) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let p = std::mem::take(&mut self.pending);
+        for t in p.iter() {
+            self.exec_taker(t, clear_ms, exposed);
+        }
+    }
+
+    fn apply_cancel(&mut self, target: u64) {
+        if self.proc.id == target {
+            self.proc.live = false;
+        } else {
+            self.tomb.insert(target);
+        }
+    }
+
+    fn apply_new(&mut self, id: u64, reff: i64) -> bool {
+        if self.tomb.remove(&id) {
+            return false;
+        }
+        self.proc = Quote {
+            live: true,
+            id,
+            reff,
+        };
+        true
+    }
+
+    fn handle_event(&mut self, ev: &Ev, clear_ms: i64, exposed: bool) {
+        match ev.kind {
+            Kind::Cancel { target } => self.apply_cancel(target),
+            Kind::New { id, reff } => {
+                if self.apply_new(id, reff) {
+                    self.flush_pending(clear_ms, exposed);
+                }
+            }
+            Kind::Taker {
+                dir,
+                notional,
+                send_ms,
+            } => {
+                let t = TakerOrd {
+                    dir,
+                    notional,
+                    send_ms,
+                };
+                if self.proc.live {
+                    self.exec_taker(&t, clear_ms, exposed);
+                } else {
+                    self.pending.push(t);
+                }
+            }
+            Kind::Sniper {
+                dir,
+                notional,
+                target_id,
+                ..
+            } => {
+                self.sniper_inflight = false;
+                if self.proc.live {
+                    self.exec_sniper(dir, notional, target_id, clear_ms, exposed);
+                } else {
+                    self.bump_missed(clear_ms);
+                }
+            }
+        }
+    }
+
+    fn process_batch(&mut self, buf: &mut Vec<Ev>, clear_ns: i64) {
+        let clear_ms = clear_ns / NS_PER_MS;
+        let exposed = buf.iter().any(|e| matches!(e.kind, Kind::Cancel { .. }));
+        buf.sort_by_key(|e| {
+            (
+                if matches!(e.kind, Kind::Cancel { .. }) {
+                    0u8
+                } else {
+                    1u8
+                },
+                e.arr_ns,
+            )
+        });
+        for ev in buf.iter() {
+            self.handle_event(ev, clear_ms, exposed);
+        }
+        self.bump_batch(clear_ms);
+    }
+
+    fn process_fba(&mut self, buf: &mut Vec<Ev>, clear_ns: i64) {
+        let clear_ms = clear_ns / NS_PER_MS;
+        for ev in buf.iter() {
+            match ev.kind {
+                Kind::Cancel { target } => self.apply_cancel(target),
+                Kind::New { id, reff } => {
+                    self.apply_new(id, reff);
+                }
+                _ => {}
+            }
+        }
+        let mut orders: Vec<TakerOrd> = std::mem::take(&mut self.pending);
+        let mut snipers: Vec<(i8, i64)> = Vec::new();
+        for ev in buf.iter() {
+            match ev.kind {
+                Kind::Taker {
+                    dir,
+                    notional,
+                    send_ms,
+                } => orders.push(TakerOrd {
+                    dir,
+                    notional,
+                    send_ms,
+                }),
+                Kind::Sniper { dir, notional, .. } => snipers.push((dir, notional)),
+                _ => {}
+            }
+        }
+        if !snipers.is_empty() {
+            self.sniper_inflight = false;
+        }
+        self.bump_batch(clear_ms);
+        if !self.proc.live {
+            self.pending = orders;
+            for _ in 0..snipers.len() {
+                self.bump_missed(clear_ms);
+            }
+            return;
+        }
+        let large_usd = self.cfg.large_usd;
+        let mut buys: i128 = 0;
+        let mut sells: i128 = 0;
+        let mut tk_total: i128 = 0;
+        let mut tk_large: i128 = 0;
+        for o in orders.iter() {
+            let n = o.notional.max(1) as i128;
+            tk_total += n;
+            if o.notional >= large_usd {
+                tk_large += n;
+            }
+            if o.dir > 0 {
+                buys += n;
+            } else {
+                sells += n;
+            }
+        }
+        for &(d, n) in snipers.iter() {
+            let n = n.max(1) as i128;
+            if d > 0 {
+                buys += n;
+            } else {
+                sells += n;
+            }
+        }
+        let net = buys - sells;
+        let netsign: i32 = if net > 0 {
+            1
+        } else if net < 0 {
+            -1
+        } else {
+            0
+        };
+        let reff = self.proc.reff;
+        for o in orders.iter() {
+            let sc = (o.dir as i32) * netsign;
+            self.rec_taker(o, reff, clear_ms, sc, false);
+        }
+        if net != 0 {
+            let mm_n = net.abs();
+            let mm_large = if tk_total > 0 {
+                mm_n * tk_large / tk_total
+            } else {
+                0
+            };
+            let mm_sign: i8 = if net > 0 { -1 } else { 1 };
+            self.rec_mm(mm_n as i64, mm_sign, reff, clear_ms, 0, mm_large, false);
+            if self.cfg.log {
+                if let Some(l) = self.log.last_mut() {
+                    l.kind = 2;
+                }
+            }
+        }
+        for _ in 0..snipers.len() {
+            self.bump_hit(clear_ms);
+        }
+    }
+}
+
+fn simulate(
+    mids: &[Mid],
+    takers: &[Taker],
+    regime: Regime,
+    cfg: &Cfg,
+    week_start_ms: i64,
+    block_ms: i64,
+    nblocks: usize,
+) -> SimOut {
+    let nblocks = nblocks.max(1);
+    if mids.is_empty() {
+        return SimOut {
+            agg: vec![Agg::default(); nblocks],
+            log: Vec::new(),
+        };
+    }
+    let mut sim = Sim {
+        mids,
+        regime,
+        cfg: *cfg,
+        week_start_ms,
+        block_ms: block_ms.max(1),
+        agg: vec![Agg::default(); nblocks],
+        proc: Quote {
+            live: true,
+            id: 0,
+            reff: mids[0].mid,
+        },
+        visible: Quote {
+            live: true,
+            id: 0,
+            reff: mids[0].mid,
+        },
+        pending: Vec::new(),
+        tomb: HashSet::new(),
+        sniper_inflight: false,
+        last_sniped_quote_id: None,
+        log: Vec::new(),
+    };
+
+    let mm_ev = gen_mm_events(mids, cfg);
+    let tk_ev = gen_taker_events(takers, cfg);
+    let mut arrivals: Vec<Ev> = Vec::with_capacity(mm_ev.len() + tk_ev.len());
+    arrivals.extend(mm_ev);
+    arrivals.extend(tk_ev);
+    arrivals.sort_by_key(|e| e.arr_ns);
+
+    const INF: i64 = i64::MAX;
+    let batch = regime.is_batch();
+    let window_ns = cfg.window_ms.max(1) * NS_PER_MS;
+    let grid0 = mids[0].ts_ms * NS_PER_MS;
+    let mut next_close = grid0 + window_ns;
+    let mut ai = 0usize;
+    let mut si = 0usize;
+    let mut sq: VecDeque<Ev> = VecDeque::new();
+    let mut buf: Vec<Ev> = Vec::new();
+    let mut commits: VecDeque<(i64, Quote)> = VecDeque::new();
+    let mut srng = SplitMix64::new(cfg.seed ^ 0x534E);
+
+    loop {
+        let t_arr_main = if ai < arrivals.len() {
+            arrivals[ai].arr_ns
+        } else {
+            INF
+        };
+        let t_arr_sq = sq.front().map_or(INF, |e| e.arr_ns);
+        let t_arr = t_arr_main.min(t_arr_sq);
+        let t_commit = commits.front().map_or(INF, |c| c.0);
+        let t_snipe = if si < mids.len() && cfg.sniper_clip_usd > 0 {
+            (mids[si].ts_ms + cfg.sniper_feed_ms + cfg.sniper_react_ms) * NS_PER_MS
+        } else {
+            INF
+        };
+        if t_arr == INF && t_snipe == INF && buf.is_empty() {
+            break;
+        }
+        if batch && buf.is_empty() {
+            let t_other = t_arr.min(t_snipe).min(t_commit);
+            if t_other != INF && t_other > next_close {
+                let k = (t_other - grid0 + window_ns - 1) / window_ns;
+                next_close = grid0 + k * window_ns;
+            }
+        }
+        let t_close = if batch { next_close } else { INF };
+        let t_min = t_commit.min(t_arr).min(t_close).min(t_snipe);
+        if t_min == INF {
+            break;
+        }
+
+        if t_commit == t_min {
+            if let Some((_, q)) = commits.pop_front() {
+                sim.visible = q;
+            }
+            continue;
+        }
+        if t_arr == t_min {
+            let ev = if t_arr_main <= t_arr_sq {
+                let e = arrivals[ai];
+                ai += 1;
+                e
+            } else {
+                match sq.pop_front() {
+                    Some(e) => e,
+                    None => continue,
+                }
+            };
+            if batch {
+                buf.push(ev);
+            } else {
+                sim.handle_event(&ev, ev.arr_ns / NS_PER_MS, false);
+                sim.visible = sim.proc;
+            }
+            continue;
+        }
+        if t_close == t_min {
+            if !buf.is_empty() {
+                let clear_ns = t_close + cfg.decrypt_ms * NS_PER_MS;
+                if regime == Regime::UniformFba {
+                    sim.process_fba(&mut buf, clear_ns);
+                } else {
+                    sim.process_batch(&mut buf, clear_ns);
+                }
+                buf.clear();
+                if cfg.decrypt_ms == 0 {
+                    sim.visible = sim.proc;
+                } else {
+                    commits.push_back((clear_ns, sim.proc));
+                }
+            }
+            next_close += window_ns;
+            continue;
+        }
+        let m = mids[si];
+        si += 1;
+        if !sim.sniper_inflight
+            && sim.visible.live
+            && sim.last_sniped_quote_id != Some(sim.visible.id)
+            && rel_sub(m.mid, sim.visible.reff).abs() >= cfg.sniper_thr_sub
+        {
+            let dir: i8 = if m.mid > sim.visible.reff { 1 } else { -1 };
+            let decide_ms = t_snipe / NS_PER_MS;
+            let arr = (decide_ms + cfg.net_ms) * NS_PER_MS + srng.range_i64(0, 200_000);
+            sq.push_back(Ev {
+                arr_ns: arr,
+                decision_ms: decide_ms,
+                kind: Kind::Sniper {
+                    dir,
+                    notional: cfg.sniper_clip_usd,
+                    send_ms: decide_ms,
+                    target_id: sim.visible.id,
+                },
+            });
+            sim.sniper_inflight = true;
+            sim.last_sniped_quote_id = Some(sim.visible.id);
+        }
+    }
+
+    if !sim.pending.is_empty() {
+        let dropped = sim.pending.len() as i64;
+        if let Some(last) = sim.agg.last_mut() {
+            last.pending_dropped += dropped;
+        }
+    }
+    SimOut {
+        agg: sim.agg,
+        log: sim.log,
+    }
+}
+
+// ============================================================================
+// Phase 2: Deterministic i128 Convolution, Endogenous s*, All-In Taker Cost
+// ============================================================================
+
+#[derive(Clone, Copy, Debug)]
+struct Econ {
+    capture_ppm: i128,
+    impact_sub: i128,
+    mm_share_ppm: i128,
+    leak_ppm: i128,
+    rebate_sub: i128,
+    opex_sub: i128,
+    horizon: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SStar {
+    Val(i128),
+    Floor,
+    Cap,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Outcome {
+    drift_q: i128,
+    mev_mm_q: i128,
+    mev_tk_q: i128,
+    s_gross: SStar,
+    s_net: SStar,
+    spread_paid_q: Option<i128>, // Component 1 of All-In Net: (tk_scoef_w / tk_n) * s*_net
+    stale_q: i128,               // Component 2 of All-In Net: taker_stale
+    wait_q: i128,                // Component 3 of All-In Net: informed_wait
+    all_in_gross: Option<i128>,
+    all_in_net: Option<i128>,    // Exact identity: spread_paid_q + stale_q + wait_q + mev_tk_q
+}
+
+fn classify(v: i128) -> SStar {
+    if v < 0 {
+        SStar::Floor
+    } else if v > S_CAP_Q {
+        SStar::Cap
+    } else {
+        SStar::Val(v)
+    }
+}
+
+fn evaluate(a: &Agg, regime: Regime, e: &Econ) -> Option<Outcome> {
+    if a.mm_n <= 0 || a.tk_n <= 0 {
+        return None;
+    }
+    let (p, large_mm, large_tk) = if regime == Regime::IbteCancelPrio {
+        (e.leak_ppm, a.mm_large_exp_n, a.tk_large_exp_n)
+    } else {
+        (e.capture_ppm, a.mm_large_n, a.tk_large_n)
+    };
+    let drift_q = a.mm_w[e.horizon] * Q / a.mm_n;
+    let den: i128 = 1_000_000_000_000;
+    let mev_mm_q = p * e.impact_sub * e.mm_share_ppm * Q * large_mm / (den * a.mm_n);
+    let mev_tk_q = p * e.impact_sub * (1_000_000 - e.mm_share_ppm) * Q * large_tk / (den * a.tk_n);
+    let gross_v = -drift_q + mev_mm_q;
+    let net_v = gross_v - e.rebate_sub * Q + e.opex_sub * Q;
+    let s_gross = classify(gross_v);
+    let s_net = classify(net_v);
+    let stale_q = a.tk_stale_w * Q / a.tk_n;
+    let wait_q = if a.tk_inf_n > 0 {
+        a.tk_inf_wait_w * Q / a.tk_inf_n
+    } else {
+        0
+    };
+    let spread_paid = |sv: SStar| -> Option<i128> {
+        let s = match sv {
+            SStar::Val(v) => v,
+            SStar::Floor => 0,
+            SStar::Cap => return None,
+        };
+        Some(a.tk_scoef_w * s / a.tk_n)
+    };
+    let sp_gross = spread_paid(s_gross);
+    let sp_net = spread_paid(s_net);
+    Some(Outcome {
+        drift_q,
+        mev_mm_q,
+        mev_tk_q,
+        s_gross,
+        s_net,
+        spread_paid_q: sp_net,
+        stale_q,
+        wait_q,
+        all_in_gross: sp_gross.map(|sp| sp + stale_q + mev_tk_q + wait_q),
+        all_in_net: sp_net.map(|sp| sp + stale_q + mev_tk_q + wait_q),
+    })
+}
+
+fn delta_all_in(b: &Agg, d: &Agg, e: &Econ) -> Option<i128> {
+    let ob = evaluate(b, Regime::CancelPrio, e)?;
+    let od = evaluate(d, Regime::IbteCancelPrio, e)?;
+    Some(od.all_in_net? - ob.all_in_net?)
+}
+
+fn ci95(mut v: Vec<i128>) -> Option<(i128, i128)> {
+    if v.len() < 20 {
+        return None;
+    }
+    v.sort();
+    let n = v.len();
+    Some((v[n * 25 / 1000], v[(n * 975 / 1000).min(n - 1)]))
+}
+
+fn verdict(ci: Option<(i128, i128)>) -> &'static str {
+    match ci {
+        None => "n/a",
+        Some((lo, hi)) => {
+            if hi < 0 {
+                "D<B"
+            } else if lo > 0 {
+                "B<D"
+            } else {
+                "~"
+            }
+        }
+    }
+}
+
+fn bootstrap_sums(combined: &[Vec<Agg>], reps: usize, seed: u64) -> Vec<Vec<Agg>> {
+    let nspec = combined.len();
+    let mut out: Vec<Vec<Agg>> = vec![Vec::new(); nspec];
+    if nspec == 0 || reps == 0 {
+        return out;
+    }
+    let nb = combined[0].len();
+    if nb == 0 {
+        return out;
+    }
+    let mut rng = SplitMix64::new(seed);
+    for _ in 0..reps {
+        let idx: Vec<usize> = (0..nb)
+            .map(|_| (rng.next_u64() % (nb as u64)) as usize)
+            .collect();
+        for s in 0..nspec {
+            let mut acc = Agg::default();
+            for &i in &idx {
+                acc.merge(&combined[s][i]);
+            }
+            out[s].push(acc);
+        }
+    }
+    out
+}
+
+// ============================================================================
+// Integer Formatting Helpers
+// ============================================================================
+
+fn fmt_bps(v_q: i128) -> String {
+    let milli = v_q / 100;
+    let sign = if milli < 0 { "-" } else { "" };
+    let a = milli.abs();
+    format!("{}{}.{:03}", sign, a / 1000, a % 1000)
+}
+
+fn fmt_s(s: SStar) -> String {
+    match s {
+        SStar::Val(v) => fmt_bps(v),
+        SStar::Floor => "<0".to_string(),
+        SStar::Cap => ">10 (infeasible)".to_string(),
+    }
+}
+
+fn fmt_opt(v: Option<i128>) -> String {
+    match v {
+        Some(x) => fmt_bps(x),
+        None => "infeasible".to_string(),
+    }
+}
+
+fn fmt_usd(val: i128) -> String {
+    let s = val.abs().to_string();
+    let len = s.len();
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if val < 0 {
+        format!("-${}", out)
+    } else {
+        format!("${}", out)
+    }
+}
+
+// ============================================================================
+// Market Data Parsers
+// ============================================================================
+
 #[inline(always)]
 fn parse_fixed_1e8(s: &str) -> Option<i64> {
     let s = s.trim();
@@ -228,7 +1081,6 @@ fn parse_fixed_1e8(s: &str) -> Option<i64> {
     if !first.is_ascii_digit() && first != b'-' && first != b'+' {
         return None;
     }
-
     let mut neg = false;
     let mut idx = 0;
     if first == b'-' {
@@ -237,12 +1089,10 @@ fn parse_fixed_1e8(s: &str) -> Option<i64> {
     } else if first == b'+' {
         idx += 1;
     }
-
     let mut int_part: i64 = 0;
     let mut frac_part: i64 = 0;
     let mut frac_scale: i64 = PRICE_SCALE;
     let mut in_frac = false;
-
     while idx < bytes.len() {
         let b = bytes[idx];
         if b == b'.' {
@@ -260,10 +1110,7 @@ fn parse_fixed_1e8(s: &str) -> Option<i64> {
         }
         idx += 1;
     }
-
-    let combined = int_part
-        .checked_mul(PRICE_SCALE)?
-        .checked_add(frac_part)?;
+    let combined = int_part.checked_mul(PRICE_SCALE)?.checked_add(frac_part)?;
     Some(if neg { -combined } else { combined })
 }
 
@@ -278,7 +1125,33 @@ fn parse_bool_fast(s: &str) -> bool {
     t.eq_ignore_ascii_case("true") || t == "1" || t.eq_ignore_ascii_case("t")
 }
 
-/// Normalizes Binance timestamps (handles ms, us, and "YYYY-MM-DD HH:MM:SS" strings)
+fn civil_to_days(y: i64, m: i64, d: i64) -> i64 {
+    let y = y - if m <= 2 { 1 } else { 0 };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn date_str(days: i64) -> String {
+    let (y, m, d) = civil_from_days(days);
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
 fn parse_timestamp_to_ms(s: &str) -> Option<i64> {
     let t = s.trim();
     if let Ok(raw) = t.parse::<i64>() {
@@ -288,7 +1161,6 @@ fn parse_timestamp_to_ms(s: &str) -> Option<i64> {
             raw
         });
     }
-    // Parse ISO format: "2026-11-10 00:00:00" or "2026-11-10T00:00:00"
     if t.len() >= 19 && t.as_bytes()[4] == b'-' && t.as_bytes()[7] == b'-' {
         let year: i64 = t[0..4].parse().ok()?;
         let month: i64 = t[5..7].parse().ok()?;
@@ -302,869 +1174,1329 @@ fn parse_timestamp_to_ms(s: &str) -> Option<i64> {
     None
 }
 
-/// Howard Hinnant's civil-from-days inverse algorithm (exact integer epoch days)
-fn civil_to_days(y: i64, m: i64, d: i64) -> i64 {
-    let y = y - if m <= 2 { 1 } else { 0 };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
+fn half_tick_1e8(sym: &str) -> i64 {
+    match sym {
+        "BTCUSDT" => 5_000_000,
+        "ETHUSDT" => 500_000,
+        _ => 0,
+    }
 }
 
-/// Loads `{SYM}-trades-{DATE}.csv` and reconstructs L1 Mid-Price using symbol-specific tick size
-fn load_trades_csv(path: &Path, symbol: Symbol) -> Result<(Vec<TickRecord>, usize), String> {
-    let file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+fn push_mid(v: &mut Vec<Mid>, ts: i64, mid: i64) {
+    if let Some(l) = v.last_mut() {
+        if l.ts_ms == ts {
+            l.mid = mid;
+            return;
+        }
+        if l.mid == mid {
+            return;
+        }
+    }
+    v.push(Mid { ts_ms: ts, mid });
+}
+
+fn notional_usd(price: i64, qty: i64) -> i64 {
+    ((price as i128 * qty as i128) / (PRICE_SCALE as i128 * QTY_SCALE as i128)) as i64
+}
+
+fn load_book_ticker(path: &Path) -> Result<Vec<Mid>, String> {
+    let file = File::open(path).map_err(|e| format!("open {}: {}", path.display(), e))?;
     let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
-
-    let half_tick = symbol.half_tick_1e8();
-    let mut ticks = Vec::with_capacity(2_500_000);
-    let mut raw_rows = 0usize;
-    let mut ema_mid: i64 = 0;
-
+    let mut out: Vec<Mid> = Vec::with_capacity(4_000_000);
+    let (mut c_bid, mut c_ask, mut c_ts) = (1usize, 3usize, 5usize);
+    let mut first = true;
     for line_res in reader.lines() {
         let line = line_res.map_err(|e| e.to_string())?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let t = line.trim();
+        if t.is_empty() {
             continue;
         }
-
-        let mut parts = trimmed.split(',');
-        let col0 = parts.next().unwrap_or("");
-        if parse_i64_fast(col0).is_none() {
-            continue; // Auto-detect & skip header
+        if first {
+            first = false;
+            if t.as_bytes()[0].is_ascii_alphabetic() {
+                for (i, name) in t.split(',').enumerate() {
+                    match name.trim() {
+                        "best_bid_price" => c_bid = i,
+                        "best_ask_price" => c_ask = i,
+                        "transaction_time" => c_ts = i,
+                        _ => {}
+                    }
+                }
+                continue;
+            }
         }
+        let mut bid: Option<i64> = None;
+        let mut ask: Option<i64> = None;
+        let mut ts: Option<i64> = None;
+        let max_c = c_bid.max(c_ask).max(c_ts);
+        for (i, f) in t.split(',').enumerate() {
+            if i == c_bid {
+                bid = parse_fixed_1e8(f);
+            } else if i == c_ask {
+                ask = parse_fixed_1e8(f);
+            } else if i == c_ts {
+                ts = parse_timestamp_to_ms(f);
+            }
+            if i >= max_c {
+                break;
+            }
+        }
+        if let (Some(b), Some(a), Some(ts)) = (bid, ask, ts) {
+            if b > 0 && a >= b {
+                push_mid(&mut out, ts, (b + a) / 2);
+            }
+        }
+    }
+    out.sort_by_key(|m| m.ts_ms);
+    Ok(out)
+}
 
-        let col_price = parts.next().unwrap_or("");
-        let col_qty = parts.next().unwrap_or("");
-        let _col_quote_qty = parts.next().unwrap_or("");
-        let col_time = parts.next().unwrap_or("");
-        let col_ibm = parts.next().unwrap_or("");
+fn merge_taker(takers: &mut Vec<Taker>, ts: i64, dir: i8, notional: i64) {
+    if let Some(l) = takers.last_mut() {
+        if l.ts_ms == ts && l.dir == dir {
+            l.notional_usd += notional;
+            return;
+        }
+    }
+    takers.push(Taker {
+        ts_ms: ts,
+        dir,
+        notional_usd: notional,
+    });
+}
 
-        let price = match parse_fixed_1e8(col_price) {
-            Some(p) if p > 0 => p,
+fn load_agg_trades_csv(path: &Path) -> Result<Vec<Taker>, String> {
+    let file = File::open(path).map_err(|e| format!("open {}: {}", path.display(), e))?;
+    let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+    let mut out: Vec<Taker> = Vec::with_capacity(1_200_000);
+    for line_res in reader.lines() {
+        let line = line_res.map_err(|e| e.to_string())?;
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let mut p = t.split(',');
+        if parse_i64_fast(p.next().unwrap_or("")).is_none() {
+            continue;
+        }
+        let price = match parse_fixed_1e8(p.next().unwrap_or("")) {
+            Some(x) if x > 0 => x,
             _ => continue,
         };
-        let qty = parse_fixed_1e8(col_qty).unwrap_or(0);
-        let ts_ms = match parse_timestamp_to_ms(col_time) {
-            Some(t) => t,
+        let qty = match parse_fixed_1e8(p.next().unwrap_or("")) {
+            Some(x) if x > 0 => x,
+            _ => continue,
+        };
+        let _first = p.next();
+        let _last = p.next();
+        let ts = match parse_timestamp_to_ms(p.next().unwrap_or("")) {
+            Some(x) => x,
             None => continue,
         };
-        let is_buyer_maker = parse_bool_fast(col_ibm);
+        let ibm = parse_bool_fast(p.next().unwrap_or(""));
+        let dir: i8 = if ibm { -1 } else { 1 };
+        merge_taker(&mut out, ts, dir, notional_usd(price, qty));
+    }
+    out.sort_by_key(|t| t.ts_ms);
+    Ok(out)
+}
 
-        // Reconstruct L1 Mid-Price:
-        // If is_buyer_maker == true -> executed on Bid -> mid = price + half_tick
-        // If is_buyer_maker == false -> executed on Ask -> mid = price - half_tick
-        let raw_mid = if is_buyer_maker {
+fn load_trades_csv(path: &Path, half_tick: i64) -> Result<(Vec<Taker>, Vec<Mid>), String> {
+    let file = File::open(path).map_err(|e| format!("open {}: {}", path.display(), e))?;
+    let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+    let mut takers: Vec<Taker> = Vec::with_capacity(2_000_000);
+    let mut mids: Vec<Mid> = Vec::with_capacity(2_000_000);
+    for line_res in reader.lines() {
+        let line = line_res.map_err(|e| e.to_string())?;
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let mut p = t.split(',');
+        if parse_i64_fast(p.next().unwrap_or("")).is_none() {
+            continue;
+        }
+        let price = match parse_fixed_1e8(p.next().unwrap_or("")) {
+            Some(x) if x > 0 => x,
+            _ => continue,
+        };
+        let qty = parse_fixed_1e8(p.next().unwrap_or("")).unwrap_or(0);
+        let _quote = p.next();
+        let ts = match parse_timestamp_to_ms(p.next().unwrap_or("")) {
+            Some(x) => x,
+            None => continue,
+        };
+        let ibm = parse_bool_fast(p.next().unwrap_or(""));
+        if qty <= 0 {
+            continue;
+        }
+        let dir: i8 = if ibm { -1 } else { 1 };
+        let mid = if ibm {
             price + half_tick
         } else {
             price - half_tick
         };
-
-        ema_mid = if ema_mid == 0 {
-            raw_mid
-        } else {
-            (raw_mid * 3 + ema_mid) / 4
-        };
-
-        raw_rows += 1;
-        ticks.push(TickRecord {
-            ts_ms,
-            mid_price: ema_mid,
-            price,
-            qty,
-            is_buyer_maker,
-        });
+        push_mid(&mut mids, ts, mid);
+        merge_taker(&mut takers, ts, dir, notional_usd(price, qty));
     }
-
-    ticks.sort_by_key(|t| t.ts_ms);
-    Ok((ticks, raw_rows))
+    takers.sort_by_key(|t| t.ts_ms);
+    mids.sort_by_key(|m| m.ts_ms);
+    Ok((takers, mids))
 }
 
-/// Loads `{SYM}-aggTrades-{DATE}.csv`
-fn load_agg_trades_csv(path: &Path) -> Result<Vec<AggTradeRecord>, String> {
-    let file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
-    let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+// ============================================================================
+// Run Specifications, CLI Arguments & Daily Parallel Worker
+// ============================================================================
 
-    let mut agg_trades = Vec::with_capacity(1_200_000);
+struct Spec {
+    regime: Regime,
+    react: i64,
+    decrypt: i64,
+    cfg: Cfg,
+    label: String,
+}
 
-    for line_res in reader.lines() {
-        let line = line_res.map_err(|e| e.to_string())?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+struct Args {
+    data_dir: String,
+    out_dir: String,
+    symbols: Vec<String>,
+    start: String,
+    days: usize,
+    window_ms: i64,
+    fba_window_ms: i64,
+    mm_react: Vec<i64>,
+    decrypt: Vec<i64>,
+    block_hours: i64,
+    allow_reconstructed: bool,
+    bootstrap: usize,
+    threads: usize,
+    skip_preflight: bool,
+    preflight_only: bool,
+}
+
+fn parse_list_i64(s: &str) -> Vec<i64> {
+    s.split(',').filter_map(|x| x.trim().parse().ok()).collect()
+}
+
+fn parse_args() -> Args {
+    let mut a = Args {
+        data_dir: "./data".to_string(),
+        out_dir: ".".to_string(),
+        symbols: vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()],
+        start: "2026-11-10".to_string(),
+        days: 7,
+        window_ms: 50,
+        fba_window_ms: 100,
+        mm_react: vec![10],
+        decrypt: vec![0, 35, 70],
+        block_hours: 3,
+        allow_reconstructed: false,
+        bootstrap: 1000,
+        threads: 4,
+        skip_preflight: false,
+        preflight_only: false,
+    };
+    let v: Vec<String> = std::env::args().skip(1).collect();
+    let mut i = 0;
+    while i < v.len() {
+        let k = v[i].clone();
+        match k.as_str() {
+            "--allow-reconstructed" => a.allow_reconstructed = true,
+            "--skip-preflight" => a.skip_preflight = true,
+            "--preflight-only" => a.preflight_only = true,
+            _ => {
+                let val = v.get(i + 1).cloned().unwrap_or_default();
+                i += 1;
+                match k.as_str() {
+                    "--data-dir" => a.data_dir = val,
+                    "--out-dir" => a.out_dir = val,
+                    "--symbols" => {
+                        a.symbols = val.split(',').map(|s| s.trim().to_string()).collect()
+                    }
+                    "--start" => a.start = val,
+                    "--days" => a.days = val.parse().unwrap_or(7),
+                    "--window-ms" => a.window_ms = val.parse().unwrap_or(50),
+                    "--fba-window-ms" => a.fba_window_ms = val.parse().unwrap_or(100),
+                    "--mm-react" => a.mm_react = parse_list_i64(&val),
+                    "--decrypt" => a.decrypt = parse_list_i64(&val),
+                    "--block-hours" => a.block_hours = val.parse().unwrap_or(3),
+                    "--bootstrap" => a.bootstrap = val.parse().unwrap_or(1000),
+                    "--threads" => a.threads = val.parse().unwrap_or(4),
+                    other => {
+                        eprintln!("Unknown CLI argument: {}", other);
+                        std::process::exit(2);
+                    }
+                }
+            }
         }
+        i += 1;
+    }
+    a.block_hours = a.block_hours.max(1);
+    a.threads = a.threads.max(1);
+    if a.mm_react.is_empty() {
+        a.mm_react = vec![10];
+    }
+    if a.decrypt.is_empty() {
+        a.decrypt = vec![0, 35, 70];
+    }
+    a
+}
 
-        let mut parts = trimmed.split(',');
-        let col0 = parts.next().unwrap_or("");
-        if parse_i64_fast(col0).is_none() {
-            continue;
+fn build_specs(args: &Args) -> Vec<Spec> {
+    let mut v: Vec<Spec> = Vec::new();
+    for &r in &args.mm_react {
+        let mut base = default_cfg();
+        base.mm_react_ms = r;
+        let mut a = base;
+        a.window_ms = args.window_ms;
+        v.push(Spec {
+            regime: Regime::Fifo,
+            react: r,
+            decrypt: 0,
+            cfg: a,
+            label: format!("A: Continuous FIFO | react {}ms", r),
+        });
+        let mut b = base;
+        b.window_ms = args.window_ms;
+        v.push(Spec {
+            regime: Regime::CancelPrio,
+            react: r,
+            decrypt: 0,
+            cfg: b,
+            label: format!("B: Cancel-Priority {}ms | react {}ms", args.window_ms, r),
+        });
+        let mut c = base;
+        c.window_ms = args.fba_window_ms;
+        v.push(Spec {
+            regime: Regime::UniformFba,
+            react: r,
+            decrypt: 0,
+            cfg: c,
+            label: format!("C: Uniform-Price FBA {}ms | react {}ms", args.fba_window_ms, r),
+        });
+        for &d in &args.decrypt {
+            let mut dd = base;
+            dd.window_ms = args.window_ms;
+            dd.decrypt_ms = d;
+            v.push(Spec {
+                regime: Regime::IbteCancelPrio,
+                react: r,
+                decrypt: d,
+                cfg: dd,
+                label: format!(
+                    "D: Dywe IBTE + Cancel-Prio {}ms (dec {}ms) | react {}ms",
+                    args.window_ms, d, r
+                ),
+            });
         }
+    }
+    v
+}
 
-        let col_price = parts.next().unwrap_or("");
-        let col_qty = parts.next().unwrap_or("");
-        let _col_first_id = parts.next().unwrap_or("");
-        let _col_last_id = parts.next().unwrap_or("");
-        let col_transact_time = parts.next().unwrap_or("");
-        let col_ibm = parts.next().unwrap_or("");
+fn find_spec(specs: &[Spec], regime: Regime, react: i64, decrypt: i64) -> Option<usize> {
+    specs
+        .iter()
+        .position(|s| s.regime == regime && s.react == react && s.decrypt == decrypt)
+}
 
-        let price = match parse_fixed_1e8(col_price) {
-            Some(p) if p > 0 => p,
-            _ => continue,
+struct DayResult {
+    aggs: Vec<Vec<Agg>>,
+    skipped: Option<String>,
+    line: String,
+    reconstructed: bool,
+    mid_ticks: usize,
+    taker_orders: usize,
+}
+
+fn run_day(
+    sym_idx: usize,
+    day_idx: usize,
+    args: &Args,
+    specs: &[Spec],
+    start_days: i64,
+    nblocks: usize,
+) -> DayResult {
+    let t0 = Instant::now();
+    let sym = args.symbols[sym_idx].clone();
+    let date = date_str(start_days + day_idx as i64);
+    let skip = |why: String| DayResult {
+        aggs: Vec::new(),
+        skipped: Some(why),
+        line: String::new(),
+        reconstructed: false,
+        mid_ticks: 0,
+        taker_orders: 0,
+    };
+    let bt_s = format!("{}/{}-bookTicker-{}.csv", args.data_dir, sym, date);
+    let tr_s = format!("{}/{}-trades-{}.csv", args.data_dir, sym, date);
+    let ag_s = format!("{}/{}-aggTrades-{}.csv", args.data_dir, sym, date);
+    let bt = Path::new(&bt_s);
+    let tr = Path::new(&tr_s);
+    let ag = Path::new(&ag_s);
+
+    let mut trade_takers: Option<Vec<Taker>> = None;
+    let mut reconstructed = false;
+    let mids: Vec<Mid> = if bt.exists() {
+        match load_book_ticker(bt) {
+            Ok(m) => m,
+            Err(e) => return skip(format!("{} {}: {}", sym, date, e)),
+        }
+    } else if args.allow_reconstructed && tr.exists() {
+        match load_trades_csv(tr, half_tick_1e8(&sym)) {
+            Ok((t, m)) => {
+                trade_takers = Some(t);
+                reconstructed = true;
+                m
+            }
+            Err(e) => return skip(format!("{} {}: {}", sym, date, e)),
+        }
+    } else {
+        return skip(format!(
+            "{} {}: missing bookTicker (and --allow-reconstructed not set)",
+            sym, date
+        ));
+    };
+    let takers: Vec<Taker> = if ag.exists() {
+        match load_agg_trades_csv(ag) {
+            Ok(t) => t,
+            Err(e) => return skip(format!("{} {}: {}", sym, date, e)),
+        }
+    } else if let Some(t) = trade_takers {
+        t
+    } else if tr.exists() {
+        match load_trades_csv(tr, 0) {
+            Ok((t, _)) => t,
+            Err(e) => return skip(format!("{} {}: {}", sym, date, e)),
+        }
+    } else {
+        return skip(format!("{} {}: missing aggTrades/trades", sym, date));
+    };
+    if mids.is_empty() || takers.is_empty() {
+        return skip(format!("{} {}: empty dataset", sym, date));
+    }
+
+    let week_start_ms = start_days * 86_400_000;
+    let block_ms = args.block_hours * 3_600_000;
+    let day_seed = 0xD15E_0000u64 ^ ((sym_idx as u64) << 32) ^ (day_idx as u64);
+    let mut aggs: Vec<Vec<Agg>> = Vec::with_capacity(specs.len());
+    for sp in specs {
+        let mut cfg = sp.cfg;
+        cfg.seed = day_seed;
+        let out = simulate(
+            &mids,
+            &takers,
+            sp.regime,
+            &cfg,
+            week_start_ms,
+            block_ms,
+            nblocks,
+        );
+        aggs.push(out.agg);
+    }
+    let line = format!(
+        "[OK] {:<8} {} | mid ticks {:>9} | takers {:>8} | source: {} | {:.1?}",
+        sym,
+        date,
+        mids.len(),
+        takers.len(),
+        if reconstructed {
+            "RECONSTRUCTED"
+        } else {
+            "bookTicker"
+        },
+        t0.elapsed()
+    );
+    DayResult {
+        aggs,
+        skipped: None,
+        line,
+        reconstructed,
+        mid_ticks: mids.len(),
+        taker_orders: takers.len(),
+    }
+}
+
+// ============================================================================
+// Synthetic Invariant Pre-Flight & Unit Tests
+// ============================================================================
+
+mod selfcheck {
+    use super::*;
+
+    pub fn synth(seed: u64, n_ticks: usize) -> (Vec<Mid>, Vec<Taker>) {
+        let mut rng = SplitMix64::new(seed);
+        let mut mids: Vec<Mid> = Vec::with_capacity(n_ticks);
+        let mut ts: i64 = 1_700_000_000_000;
+        let mut p: i64 = 9_000_000_000_000;
+        for _ in 0..n_ticks {
+            ts += 1 + rng.range_i64(0, 3);
+            let step = (1 + rng.range_i64(0, 9)) * 10_000_000;
+            p += if rng.next_u64() & 1 == 0 { step } else { -step };
+            if rng.range_i64(0, 799) == 0 {
+                let j = ((p as i128) * ((300 + rng.range_i64(0, 200)) as i128) / SUB) as i64;
+                p += if rng.next_u64() & 1 == 0 { j } else { -j };
+            }
+            mids.push(Mid { ts_ms: ts, mid: p });
+        }
+        let end = ts;
+        let mut takers: Vec<Taker> = Vec::new();
+        let mut t = mids[0].ts_ms;
+        while t < end {
+            t += 5 + rng.range_i64(0, 70);
+            let notional = 1_000 + rng.range_i64(0, 120_000);
+            let dir: i8 = if rng.next_u64() & 1 == 0 { 1 } else { -1 };
+            takers.push(Taker {
+                ts_ms: t,
+                dir,
+                notional_usd: notional,
+            });
+        }
+        (mids, takers)
+    }
+
+    fn run(mids: &[Mid], takers: &[Taker], regime: Regime, cfg: &Cfg) -> SimOut {
+        simulate(mids, takers, regime, cfg, mids[0].ts_ms, 60_000, 64)
+    }
+
+    fn cfg_for(regime: Regime) -> Cfg {
+        let mut c = default_cfg();
+        c.log = true;
+        match regime {
+            Regime::UniformFba => c.window_ms = 100,
+            Regime::IbteCancelPrio => c.decrypt_ms = 35,
+            _ => {}
+        }
+        c
+    }
+
+    pub fn causality() -> Result<String, String> {
+        let (mids, takers) = synth(7, 200_000);
+        let t_cut = mids[mids.len() / 2].ts_ms;
+        let mut mids2 = mids.clone();
+        let mut takers2 = takers.clone();
+        for m in mids2.iter_mut() {
+            if m.ts_ms > t_cut {
+                m.mid += if m.ts_ms & 1 == 0 {
+                    50_000_000_000
+                } else {
+                    -30_000_000_000
+                };
+            }
+        }
+        for t in takers2.iter_mut() {
+            if t.ts_ms > t_cut {
+                t.dir = -t.dir;
+                t.notional_usd += 77_000;
+            }
+        }
+        let regimes = [
+            Regime::Fifo,
+            Regime::CancelPrio,
+            Regime::UniformFba,
+            Regime::IbteCancelPrio,
+        ];
+        let mut checked = 0usize;
+        for &r in regimes.iter() {
+            let cfg = cfg_for(r);
+            let o1 = run(&mids, &takers, r, &cfg);
+            let o2 = run(&mids2, &takers2, r, &cfg);
+            let f1: Vec<FillLog> = o1
+                .log
+                .iter()
+                .filter(|x| x.clear_ms <= t_cut)
+                .cloned()
+                .collect();
+            let f2: Vec<FillLog> = o2
+                .log
+                .iter()
+                .filter(|x| x.clear_ms <= t_cut)
+                .cloned()
+                .collect();
+            if f1.is_empty() {
+                return Err(format!("causality: regime {} had zero fills prior to T", r.code()));
+            }
+            if f1 != f2 {
+                return Err(format!(
+                    "causality: regime {} fills prior to T changed after mutating future ticks",
+                    r.code()
+                ));
+            }
+            checked += f1.len();
+        }
+        Ok(format!(
+            "{} fills prior to T matched bit-for-bit across all 4 regimes",
+            checked
+        ))
+    }
+
+    pub fn identity() -> Result<String, String> {
+        let (mids, takers) = synth(11, 200_000);
+        let mut cb = default_cfg();
+        cb.log = false;
+        let mut cd = cb;
+        cd.decrypt_ms = 0;
+        let ob = run(&mids, &takers, Regime::CancelPrio, &cb);
+        let od = run(&mids, &takers, Regime::IbteCancelPrio, &cd);
+        if ob.agg != od.agg {
+            return Err("identity: D(decrypt=0) != B at Agg accumulator level".to_string());
+        }
+        let e = Econ {
+            capture_ppm: 0,
+            impact_sub: 200,
+            mm_share_ppm: 500_000,
+            leak_ppm: 0,
+            rebate_sub: 50,
+            opex_sub: 30,
+            horizon: 2,
         };
-        let qty = match parse_fixed_1e8(col_qty) {
-            Some(q) if q > 0 => q,
-            _ => continue,
+        let tb = total(&ob.agg);
+        let td = total(&od.agg);
+        let eb = evaluate(&tb, Regime::CancelPrio, &e);
+        let ed = evaluate(&td, Regime::IbteCancelPrio, &e);
+        match (eb, ed) {
+            (Some(x), Some(y)) => {
+                if x.s_net != y.s_net || x.all_in_net != y.all_in_net {
+                    return Err("identity: Outcome(D) != Outcome(B)".to_string());
+                }
+            }
+            _ => return Err("identity: evaluate returned None".to_string()),
+        }
+        let mut cd35 = cb;
+        cd35.decrypt_ms = 35;
+        let od35 = run(&mids, &takers, Regime::IbteCancelPrio, &cd35);
+        if od35.agg == ob.agg {
+            return Ok(
+                "D==B at decrypt=0; WARNING: decrypt=35 produced no state change".to_string(),
+            );
+        }
+        Ok("D==B bit-for-bit at decrypt=0, mev=0, leak=0; decrypt=35 alters execution timing".to_string())
+    }
+
+    pub fn shuffled_zero_spread() -> Result<String, String> {
+        let (mids, base) = synth(21, 150_000);
+        let mut cfg = default_cfg();
+        cfg.sniper_clip_usd = 0;
+        let k: usize = 16;
+        let mut means: Vec<f64> = Vec::new();
+        for s in 0..k {
+            let mut rng = SplitMix64::new(1000 + s as u64);
+            let tk: Vec<Taker> = base
+                .iter()
+                .map(|t| Taker {
+                    ts_ms: t.ts_ms,
+                    dir: if rng.next_u64() & 1 == 0 { 1 } else { -1 },
+                    notional_usd: t.notional_usd,
+                })
+                .collect();
+            let o = run(&mids, &tk, Regime::Fifo, &cfg);
+            let a = total(&o.agg);
+            if a.mm_n == 0 {
+                return Err("shuffled: zero fills recorded".to_string());
+            }
+            means.push((a.mm_w[2] * Q / a.mm_n) as f64);
+        }
+        let kf = k as f64;
+        let mean = means.iter().sum::<f64>() / kf;
+        let var = means.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / (kf - 1.0);
+        let se = (var / kf).sqrt();
+        if mean.abs() > 4.0 * se + 50.0 {
+            return Err(format!(
+                "shuffled: |mean|={:.1}q > 4*SE+50 (SE={:.1}q): hidden directional bias",
+                mean.abs(),
+                se
+            ));
+        }
+        let tk_inf: Vec<Taker> = base
+            .iter()
+            .map(|t| {
+                let a = mid_at(&mids, t.ts_ms);
+                let b = mid_at(&mids, t.ts_ms + 1000);
+                Taker {
+                    ts_ms: t.ts_ms,
+                    dir: if b > a { 1 } else { -1 },
+                    notional_usd: t.notional_usd,
+                }
+            })
+            .collect();
+        let oi = run(&mids, &tk_inf, Regime::Fifo, &cfg);
+        let ai = total(&oi.agg);
+        let mi = ai.mm_w[2] * Q / ai.mm_n.max(1);
+        if mi >= -5_000 {
+            return Err(format!(
+                "shuffled: informed flow drift={}q, expected strongly negative",
+                mi
+            ));
+        }
+        Ok(format!(
+            "shuffled mean={:.1}q (SE={:.1}q) ~ 0; informed flow drift={}q < 0",
+            mean, se, mi
+        ))
+    }
+
+    pub fn mev_share_sum() -> Result<String, String> {
+        let n: i128 = 1_000_000_000;
+        let large: i128 = 200_000_000;
+        let a = Agg {
+            mm_n: n,
+            tk_n: n,
+            mm_large_n: large,
+            tk_large_n: large,
+            ..Agg::default()
         };
-        let ts_ms = match parse_timestamp_to_ms(col_transact_time) {
-            Some(t) => t,
+        for &m in [0i128, 250_000, 500_000, 1_000_000].iter() {
+            let e = Econ {
+                capture_ppm: 500_000,
+                impact_sub: 200,
+                mm_share_ppm: m,
+                leak_ppm: 0,
+                rebate_sub: 0,
+                opex_sub: 0,
+                horizon: 2,
+            };
+            let o = evaluate(&a, Regime::CancelPrio, &e).ok_or("evaluate returned None")?;
+            let got = o.mev_mm_q * n + o.mev_tk_q * n;
+            let want = e.capture_ppm * e.impact_sub * large * Q / 1_000_000;
+            if (got - want).abs() > 2 * n {
+                return Err(format!("mev_share_sum: m={} got={} want={}", m, got, want));
+            }
+        }
+        Ok("MM and taker MEV shares sum identically to total extraction".to_string())
+    }
+
+    pub fn sniper_protection() -> Result<String, String> {
+        let (mids, takers) = synth(31, 300_000);
+        let ca = default_cfg();
+        let oa = run(&mids, &takers, Regime::Fifo, &ca);
+        let ob = run(&mids, &takers, Regime::CancelPrio, &ca);
+        let ha = total(&oa.agg).sniper_hit;
+        let hb = total(&ob.agg).sniper_hit;
+        if ha == 0 {
+            return Err("sniper_protection: zero stale sniper hits in Regime A".to_string());
+        }
+        if hb >= ha {
+            return Err(format!(
+                "sniper_protection: Regime B ({}) did not reduce stale hits vs Regime A ({})",
+                hb, ha
+            ));
+        }
+        Ok(format!("true stale sniper hits: Regime A={} > Regime B={}", ha, hb))
+    }
+
+    /// Verifies exact additive reconciliation of MM volume, cohort markouts, and All-In Net Taker Cost.
+    pub fn accounting_reconciliation() -> Result<String, String> {
+        let (mids, takers) = synth(47, 150_000);
+        let regimes = [
+            Regime::Fifo,
+            Regime::CancelPrio,
+            Regime::UniformFba,
+            Regime::IbteCancelPrio,
+        ];
+        let econ = Econ {
+            capture_ppm: 250_000,
+            impact_sub: 150,
+            mm_share_ppm: 500_000,
+            leak_ppm: 100_000,
+            rebate_sub: 50,
+            opex_sub: 30,
+            horizon: 2,
+        };
+        for &r in regimes.iter() {
+            let cfg = cfg_for(r);
+            let out = run(&mids, &takers, r, &cfg);
+            let a = total(&out.agg);
+            let sum_vol = a.mm_taker_n + a.mm_sniper_stale_n + a.mm_sniper_late_n;
+            if a.mm_n != sum_vol {
+                return Err(format!(
+                    "accounting: regime {} mm_n ({}) != cohort sum ({})",
+                    r.code(),
+                    a.mm_n,
+                    sum_vol
+                ));
+            }
+            let sum_w1s = a.mm_taker_w1s + a.mm_sniper_stale_w1s + a.mm_sniper_late_w1s;
+            if a.mm_w[2] != sum_w1s {
+                return Err(format!(
+                    "accounting: regime {} mm_w[2] ({}) != cohort w1s sum ({})",
+                    r.code(),
+                    a.mm_w[2],
+                    sum_w1s
+                ));
+            }
+            let o = evaluate(&a, r, &econ).ok_or("evaluate returned None")?;
+            if let (Some(sp), Some(all_in)) = (o.spread_paid_q, o.all_in_net) {
+                let recomputed = sp + o.stale_q + o.wait_q + o.mev_tk_q;
+                if all_in != recomputed {
+                    return Err(format!(
+                        "accounting: regime {} all_in_net ({}) != sum of components ({})",
+                        r.code(),
+                        all_in,
+                        recomputed
+                    ));
+                }
+            }
+        }
+        Ok("exact volume, cohort markout, and All-In Net component identity verified across all regimes".to_string())
+    }
+
+    pub fn run_all() -> bool {
+        let checks: [(&str, fn() -> Result<String, String>); 6] = [
+            ("causality (no look-ahead)", causality),
+            ("identity D==B (decrypt=0, mev=0, leak=0)", identity),
+            ("shuffled-side zero-spread + sign control", shuffled_zero_spread),
+            ("MEV share conservation (no double-count)", mev_share_sum),
+            ("sniper protection via cancel-priority", sniper_protection),
+            ("accounting reconciliation (volumes & All-In)", accounting_reconciliation),
+        ];
+        let mut ok = true;
+        for (name, f) in checks.iter() {
+            match f() {
+                Ok(msg) => println!("[PREFLIGHT OK ] {} — {}", name, msg),
+                Err(e) => {
+                    println!("[PREFLIGHT FAIL] {} — {}", name, e);
+                    ok = false;
+                }
+            }
+        }
+        ok
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selfcheck;
+
+    #[test]
+    fn t_causality() {
+        selfcheck::causality().unwrap();
+    }
+    #[test]
+    fn t_identity() {
+        selfcheck::identity().unwrap();
+    }
+    #[test]
+    fn t_shuffled_zero_spread() {
+        selfcheck::shuffled_zero_spread().unwrap();
+    }
+    #[test]
+    fn t_mev_share_sum() {
+        selfcheck::mev_share_sum().unwrap();
+    }
+    #[test]
+    fn t_sniper_protection() {
+        selfcheck::sniper_protection().unwrap();
+    }
+    #[test]
+    fn t_accounting_reconciliation() {
+        selfcheck::accounting_reconciliation().unwrap();
+    }
+}
+
+// ============================================================================
+// Markdown & HTML Report Generation
+// ============================================================================
+
+fn base_econ() -> Econ {
+    Econ {
+        capture_ppm: 0,
+        impact_sub: 0,
+        mm_share_ppm: 500_000,
+        leak_ppm: 0,
+        rebate_sub: 50,
+        opex_sub: 30,
+        horizon: 2,
+    }
+}
+
+fn table(rep: &mut String, title: &str, specs: &[Spec], totals: &[Agg]) {
+    let e0 = base_econ();
+    emit!(rep, "\n### {}", title);
+    emit!(
+        rep,
+        "| Regime | MM Total Vol | Markout 0ms | 100ms | 1s | s* gross | s* net | [1] Spread Paid | [2] Taker Stale | [3] Informed Wait | [=] All-In Net ([1]+[2]+[3]) | StaleSnipe Hit/Miss | Batches |"
+    );
+    emit!(
+        rep,
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+    );
+    for (sp, a) in specs.iter().zip(totals.iter()) {
+        match evaluate(a, sp.regime, &e0) {
+            None => {
+                emit!(rep, "| {} | n/a | | | | | | | | | | | |", sp.label);
+            }
+            Some(o) => {
+                let m0 = a.mm_w[0] * Q / a.mm_n;
+                let m1 = a.mm_w[1] * Q / a.mm_n;
+                let m2 = a.mm_w[2] * Q / a.mm_n;
+                emit!(
+                    rep,
+                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {}/{} | {} |",
+                    sp.label,
+                    fmt_usd(a.mm_n),
+                    fmt_bps(m0),
+                    fmt_bps(m1),
+                    fmt_bps(m2),
+                    fmt_s(o.s_gross),
+                    fmt_s(o.s_net),
+                    fmt_opt(o.spread_paid_q),
+                    fmt_bps(o.stale_q),
+                    fmt_bps(o.wait_q),
+                    fmt_opt(o.all_in_net),
+                    a.sniper_hit,
+                    a.sniper_missed,
+                    a.batches
+                );
+            }
+        }
+    }
+    emit!(
+        rep,
+        "\nUnits: bps. Exact identity at MEV=0: `[1] Spread Paid + [2] Taker Stale + [3] Informed Wait = All-In Net` (within 0.001 bps display rounding)."
+    );
+}
+
+fn cohort_table(rep: &mut String, title: &str, specs: &[Spec], totals: &[Agg]) {
+    emit!(rep, "\n### {} — MM Flow Cohort Decomposition & Volume Reconciliation", title);
+    emit!(
+        rep,
+        "| Regime | Taker Vol | StaleSnipe Vol | LateSnipe Vol | Total MM Vol | Vol Diff | Taker 1s Markout | StaleSnipe 1s Markout | LateSnipe 1s Markout |"
+    );
+    emit!(
+        rep,
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|"
+    );
+    for (sp, a) in specs.iter().zip(totals.iter()) {
+        let sum_v = a.mm_taker_n + a.mm_sniper_stale_n + a.mm_sniper_late_n;
+        let diff_v = a.mm_n - sum_v;
+        let m_tk = if a.mm_taker_n > 0 {
+            fmt_bps(a.mm_taker_w1s * Q / a.mm_taker_n)
+        } else {
+            "n/a".to_string()
+        };
+        let m_st = if a.mm_sniper_stale_n > 0 {
+            fmt_bps(a.mm_sniper_stale_w1s * Q / a.mm_sniper_stale_n)
+        } else {
+            "n/a".to_string()
+        };
+        let m_lt = if a.mm_sniper_late_n > 0 {
+            fmt_bps(a.mm_sniper_late_w1s * Q / a.mm_sniper_late_n)
+        } else {
+            "n/a".to_string()
+        };
+        emit!(
+            rep,
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            sp.label,
+            fmt_usd(a.mm_taker_n),
+            fmt_usd(a.mm_sniper_stale_n),
+            fmt_usd(a.mm_sniper_late_n),
+            fmt_usd(a.mm_n),
+            fmt_usd(diff_v),
+            m_tk,
+            m_st,
+            m_lt
+        );
+    }
+    emit!(
+        rep,
+        "\nReconciliation note: `StaleSnipe` represents orders hitting the exact un-updated quote ID targeted at trigger time; `LateSnipe` represents sniper orders arriving after MM already requoted to a fresh reference mid."
+    );
+}
+
+struct FrontierGrid {
+    decrypt_ms: i64,
+    react_ms: i64,
+    cells: Vec<String>,
+}
+
+fn frontier(
+    rep: &mut String,
+    csv: &mut String,
+    specs: &[Spec],
+    full: &[Agg],
+    boot: &[Vec<Agg>],
+    args: &Args,
+) -> Vec<FrontierGrid> {
+    let mut html_grids = Vec::new();
+    csv.push_str("react_ms,decrypt_ms,capture_ppm,impact_sub,mm_share_ppm,leak_ppm,allin_B_q,allin_D_q,delta_D_minus_B_q,ci_lo_q,ci_hi_q,verdict\n");
+    for &react in &args.mm_react {
+        let ib = match find_spec(specs, Regime::CancelPrio, react, 0) {
+            Some(i) => i,
             None => continue,
         };
-        let is_buyer_maker = parse_bool_fast(col_ibm);
-
-        let notional_usd = ((price as i128 * qty as i128)
-            / (PRICE_SCALE as i128 * QTY_SCALE as i128)) as i64;
-
-        agg_trades.push(AggTradeRecord {
-            ts_ms,
-            price,
-            qty,
-            notional_usd,
-            is_buyer_maker,
-        });
-    }
-
-    agg_trades.sort_by_key(|a| a.ts_ms);
-    Ok(agg_trades)
-}
-
-/// Graceful fallback: synthesizes aggregated taker market orders directly from individual `trades`
-/// when `aggTrades` is missing for a given day (e.g., ETHUSDT-aggTrades-2026-11-15.csv).
-/// Graceful fallback: synthesizes aggregated taker market orders directly from individual `trades`
-/// when `aggTrades` is missing for a given day (e.g., ETHUSDT-aggTrades-2026-11-15.csv).
-fn synthesize_agg_from_trades(ticks: &[TickRecord]) -> Vec<AggTradeRecord> {
-    let mut agg: Vec<AggTradeRecord> = Vec::with_capacity(ticks.len() / 2);
-    for t in ticks {
-        if t.qty <= 0 {
-            continue;
-        }
-        // Group consecutive trades with identical millisecond timestamp & aggressor side
-        let merged = if let Some(last) = agg.last_mut() {
-            if last.ts_ms == t.ts_ms && last.is_buyer_maker == t.is_buyer_maker {
-                last.qty = last.qty.saturating_add(t.qty);
-                last.price = t.price;
-                last.notional_usd = ((last.price as i128 * last.qty as i128)
-                    / (PRICE_SCALE as i128 * QTY_SCALE as i128)) as i64;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        if !merged {
-            let notional_usd = ((t.price as i128 * t.qty as i128)
-                / (PRICE_SCALE as i128 * QTY_SCALE as i128)) as i64;
-            agg.push(AggTradeRecord {
-                ts_ms: t.ts_ms,
-                price: t.price,
-                qty: t.qty,
-                notional_usd,
-                is_buyer_maker: t.is_buyer_maker,
-            });
-        }
-    }
-    agg
-}
-
-/// Loads `{SYM}-bookDepth-{DATE}.csv` (`timestamp, percentage, depth, notional`)
-/// Extracts +/-1% orderbook liquidity and computes endogenous Market Impact elasticity.
-fn load_book_depth_csv(path: &Path, symbol: Symbol) -> Vec<DepthSnapshot> {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
-    };
-    let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
-
-    let mut snapshots: Vec<DepthSnapshot> = Vec::with_capacity(10_000);
-    let mut cur_ts: i64 = -1;
-    let mut accum_1pct_notional_usd: i128 = 0;
-
-    for line_res in reader.lines().flatten() {
-        let trimmed = line_res.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let mut parts = trimmed.split(',');
-        let col_ts = parts.next().unwrap_or("");
-        let ts_ms = match parse_timestamp_to_ms(col_ts) {
-            Some(t) => t,
-            None => continue, // Skip header
-        };
-
-        let col_pct = parts.next().unwrap_or("");
-        let col_depth = parts.next().unwrap_or("");
-        let col_notional = parts.next().unwrap_or("");
-
-        // Percentage in Binance bookDepth is typically -1, 1, -2, 2, ..., -5, 5 (or -0.01, 0.01)
-        let pct_1e8 = parse_fixed_1e8(col_pct).unwrap_or(0).abs();
-        let is_1pct_band = pct_1e8 <= 100_000_000; // <= 1.00%
-
-        let notional_1e8 = parse_fixed_1e8(col_notional)
-            .or_else(|| parse_fixed_1e8(col_depth))
-            .unwrap_or(0)
-            .abs();
-        let notional_usd = (notional_1e8 / PRICE_SCALE) as i128;
-
-        if cur_ts != -1 && ts_ms != cur_ts {
-            let eff_depth = if accum_1pct_notional_usd > 100_000 {
-                accum_1pct_notional_usd
-            } else {
-                symbol.default_depth_1pct_usd()
+        for &dec in &args.decrypt {
+            let id = match find_spec(specs, Regime::IbteCancelPrio, react, dec) {
+                Some(i) => i,
+                None => continue,
             };
-            // Linear Kyle's Lambda impact: 1% = 10,000 sub-bps across `eff_depth`.
-            // Top-of-book concentration factor = 3.2x -> sub-bps impact per $100k order:
-            let impact_per_100k = ((10_000i128 * 32 * 100_000) / (eff_depth * 10)).clamp(4, 95);
-            snapshots.push(DepthSnapshot {
-                ts_ms: cur_ts,
-                depth_1pct_usd: eff_depth,
-                impact_sub_bps_per_100k: impact_per_100k,
-            });
-            accum_1pct_notional_usd = 0;
-        }
-
-        cur_ts = ts_ms;
-        if is_1pct_band {
-            accum_1pct_notional_usd += notional_usd;
-        }
-    }
-
-    if cur_ts != -1 {
-        let eff_depth = if accum_1pct_notional_usd > 100_000 {
-            accum_1pct_notional_usd
-        } else {
-            symbol.default_depth_1pct_usd()
-        };
-        let impact_per_100k = ((10_000i128 * 32 * 100_000) / (eff_depth * 10)).clamp(4, 95);
-        snapshots.push(DepthSnapshot {
-            ts_ms: cur_ts,
-            depth_1pct_usd: eff_depth,
-            impact_sub_bps_per_100k: impact_per_100k,
-        });
-    }
-
-    snapshots.sort_by_key(|s| s.ts_ms);
-    snapshots
-}
-
-/// Binary search lookup of L1 Mid-Price at timestamp `target_ts_ms`
-#[inline(always)]
-fn lookup_mid_price_at(ticks: &[TickRecord], target_ts_ms: i64) -> i64 {
-    if ticks.is_empty() {
-        return 0;
-    }
-    let idx = ticks.partition_point(|t| t.ts_ms <= target_ts_ms);
-    if idx == 0 {
-        ticks[0].mid_price
-    } else if idx >= ticks.len() {
-        ticks[ticks.len() - 1].mid_price
-    } else {
-        ticks[idx - 1].mid_price
-    }
-}
-
-/// Binary search lookup of current `bookDepth` impact elasticity (sub-bps per $100k swept)
-#[inline(always)]
-fn lookup_depth_impact_at(depths: &[DepthSnapshot], target_ts_ms: i64, symbol: Symbol) -> i128 {
-    if depths.is_empty() {
-        let def_d = symbol.default_depth_1pct_usd();
-        return ((10_000i128 * 32 * 100_000) / (def_d * 10)).clamp(4, 95);
-    }
-    let idx = depths.partition_point(|d| d.ts_ms <= target_ts_ms);
-    if idx == 0 {
-        depths[0].impact_sub_bps_per_100k
-    } else if idx >= depths.len() {
-        depths[depths.len() - 1].impact_sub_bps_per_100k
-    } else {
-        depths[idx - 1].impact_sub_bps_per_100k
-    }
-}
-
-/// Simulated BLS12-381 IBTE Batch Decryption (Constant-time XOR + integrity mixing per encrypted order)
-#[inline(always)]
-fn ibte_threshold_decrypt_payload(payload: &[u8; 32], batch_epoch_key: u64) -> u64 {
-    let mut acc: u64 = batch_epoch_key ^ 0x4459_5745_424c_5331; // "DYWEBLS1"
-    for chunk in payload.chunks_exact(8) {
-        let word = u64::from_le_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-        ]);
-        acc = acc.wrapping_add(word).rotate_left(13) ^ 0x9e3779b97f4a7c15;
-    }
-    acc
-}
-
-/// Runs the 100% endogenous microstructural backtest for a single (Symbol, Day, Regime)
-fn simulate_day_regime(
-    symbol: Symbol,
-    regime: Regime,
-    ticks: &[TickRecord],
-    agg_trades: &[AggTradeRecord],
-    depths: &[DepthSnapshot],
-    acc: &mut AccumulatorStats,
-) {
-    if ticks.is_empty() {
-        return;
-    }
-
-    let mut rng = SplitMix64::new(0xD15E_2026_1114 ^ (symbol as u64));
-    let batch_ms = regime.batch_window_ms();
-
-    let start_ts = ticks.first().unwrap().ts_ms;
-    let end_ts = ticks.last().unwrap().ts_ms;
-
-    let mut tick_idx = 0usize;
-    let mut agg_idx = 0usize;
-
-    // MM State
-    let mut active_quote_id: u64 = 1;
-    let mut mm_quote_mid: i64 = ticks[0].mid_price;
-
-    // MM base half-spread (in sub-bps, 100 = 1.00 bps):
-    // In Regime C (DFBA 100ms), MM widens baseline quote to 1.45 bps half-spread (2.90 bps full)
-    // due to 100ms blind inventory lock between discrete auction clearings.
-    let mm_quoted_half_spread_sub_bps: i128 = match regime {
-        Regime::RegimeC => 145,
-        _ => 100,
-    };
-
-    let mut day_mm_fills: Vec<MmFill> = Vec::with_capacity(agg_trades.len() / 2 + 10_000);
-    let mut batch_events: Vec<BatchEvent> = Vec::with_capacity(256);
-    let mut cur_batch_start = start_ts;
-
-    while cur_batch_start <= end_ts {
-        let cur_batch_end = cur_batch_start + batch_ms;
-        batch_events.clear();
-        acc.total_batches += 1;
-
-        let batch_open_mid = mm_quote_mid;
-        let mut latest_mid_in_batch = mm_quote_mid;
-        let mut batch_min_mid = latest_mid_in_batch;
-        let mut batch_max_mid = latest_mid_in_batch;
-        let mut cancel_dispatched_for_quote: u64 = 0;
-
-        // 1. Scan underlying L1 ticks inside [cur_batch_start, cur_batch_end)
-        while tick_idx < ticks.len() && ticks[tick_idx].ts_ms < cur_batch_end {
-            let tick = &ticks[tick_idx];
-            latest_mid_in_batch = tick.mid_price;
-            if tick.mid_price < batch_min_mid {
-                batch_min_mid = tick.mid_price;
-            }
-            if tick.mid_price > batch_max_mid {
-                batch_max_mid = tick.mid_price;
-            }
-
-            let delta_mid = (tick.mid_price - mm_quote_mid) as i128;
-            let abs_shift_sub_bps = (delta_mid.abs() * SUB_BPS_SCALE) / (mm_quote_mid as i128);
-
-            // Condition 1: When mid-price shifts > 1.5 bps (150 sub-bps), MM dispatches CANCEL + NEW_ORDER
-            if abs_shift_sub_bps >= 150 && cancel_dispatched_for_quote != active_quote_id {
-                cancel_dispatched_for_quote = active_quote_id;
-                let mm_reaction_ms = rng.range_i64(5, 15);
-                let client_net_ms = 30;
-                let arrival_ns = (tick.ts_ms + client_net_ms + mm_reaction_ms) * 1_000_000
-                    + rng.range_i64(0, 500_000);
-
-                batch_events.push(BatchEvent {
-                    arrival_ts_ns: arrival_ns,
-                    class: OrderClass::MmCancel,
-                    is_sell_taker: false,
-                    qty: 0,
-                    notional_usd: 0,
-                    target_quote_id: active_quote_id,
-                    encrypted_payload: [0u8; 32],
-                });
-
-                batch_events.push(BatchEvent {
-                    arrival_ts_ns: arrival_ns + 50_000,
-                    class: OrderClass::MmNewQuote,
-                    is_sell_taker: false,
-                    qty: 0,
-                    notional_usd: 0,
-                    target_quote_id: active_quote_id + 1,
-                    encrypted_payload: [0u8; 32],
-                });
-            }
-
-            // Condition 2: Latency Arbitrage Snipers (> 2.0 bps shift).
-            // In Regime C (DFBA 100ms), individual stale quote sniping does NOT exist (uniform clearing price).
-            if abs_shift_sub_bps >= 200 && regime != Regime::RegimeC {
-                let sniper_reaction_ms = rng.range_i64(1, 4);
-                let sniper_arrival_ns = (tick.ts_ms + 30 + sniper_reaction_ms) * 1_000_000
-                    + rng.range_i64(0, 200_000);
-
-                let is_sell_taker = delta_mid < 0;
-                // Clip size: 0.25 BTC or 3.5 ETH (~$20k-$25k)
-                let sniper_qty = match symbol {
-                    Symbol::BtcUsdt => QTY_SCALE / 4,
-                    Symbol::EthUsdt => (QTY_SCALE * 7) / 2,
-                };
-                let sniper_notional = ((tick.mid_price as i128 * sniper_qty as i128)
-                    / (PRICE_SCALE as i128 * QTY_SCALE as i128)) as i64;
-
-                batch_events.push(BatchEvent {
-                    arrival_ts_ns: sniper_arrival_ns,
-                    class: OrderClass::LatencySniper,
-                    is_sell_taker,
-                    qty: sniper_qty,
-                    notional_usd: sniper_notional.max(1),
-                    target_quote_id: active_quote_id,
-                    encrypted_payload: [0xAA; 32],
-                });
-            }
-
-            tick_idx += 1;
-        }
-
-        // Check LULD Circuit Breaker (+/- 2.50% move within 50ms micro-batch horizon)
-        if batch_min_mid > 0 {
-            let intra_move_sub_bps =
-                (((batch_max_mid - batch_min_mid) as i128) * SUB_BPS_SCALE) / (batch_min_mid as i128);
-            if intra_move_sub_bps >= LULD_THRESHOLD_SUB_BPS {
-                acc.luld_triggers += 1;
-            }
-        }
-
-        // 2. Ingest real Directional Takers from `aggTrades` inside [cur_batch_start, cur_batch_end)
-        while agg_idx < agg_trades.len() && agg_trades[agg_idx].ts_ms < cur_batch_end {
-            let agg = &agg_trades[agg_idx];
-            let taker_arrival_ns = (agg.ts_ms + 30) * 1_000_000 + rng.range_i64(0, 900_000);
-
-            // In transparent mempool regimes (Regime A, B, C), MEV Searchers observe orders > $50,000
-            if agg.notional_usd >= 50_000 && regime != Regime::RegimeD {
-                batch_events.push(BatchEvent {
-                    arrival_ts_ns: taker_arrival_ns - 10_000,
-                    class: OrderClass::MevFrontrun,
-                    is_sell_taker: agg.is_buyer_maker,
-                    qty: agg.qty,
-                    notional_usd: agg.notional_usd,
-                    target_quote_id: active_quote_id,
-                    encrypted_payload: [0xF0; 32],
-                });
-            }
-
-            batch_events.push(BatchEvent {
-                arrival_ts_ns: taker_arrival_ns,
-                class: OrderClass::DirectionalTaker,
-                is_sell_taker: agg.is_buyer_maker,
-                qty: agg.qty,
-                notional_usd: agg.notional_usd.max(1),
-                target_quote_id: active_quote_id,
-                encrypted_payload: [0x5A; 32],
-            });
-
-            agg_idx += 1;
-        }
-
-        // 3. Execute CLOB / Auction Batch Matching Engine Core
-        if !batch_events.is_empty() {
-            let timer = Instant::now();
-
-            match regime {
-                Regime::RegimeA | Regime::RegimeC => {
-                    batch_events.sort_by_key(|e| e.arrival_ts_ns);
-                }
-                Regime::RegimeB => {
-                    batch_events.sort_by_key(|e| {
-                        let prio = if e.class == OrderClass::MmCancel { 0u8 } else { 1u8 };
-                        (prio, e.arrival_ts_ns)
-                    });
-                }
-                Regime::RegimeD => {
-                    let epoch_key = cur_batch_end as u64;
-                    let mut checksum: u64 = 0;
-                    for ev in batch_events.iter() {
-                        checksum ^= ibte_threshold_decrypt_payload(&ev.encrypted_payload, epoch_key);
-                    }
-                    std::hint::black_box(checksum);
-
-                    batch_events.sort_by_key(|e| {
-                        let prio = if e.class == OrderClass::MmCancel { 0u8 } else { 1u8 };
-                        (prio, e.arrival_ts_ns)
-                    });
-                }
-            }
-
-            // Real orderbook depth impact elasticity at current timestamp (from `bookDepth`)
-            let depth_impact_per_100k = lookup_depth_impact_at(depths, cur_batch_end, symbol);
-
-            let mut quote_alive = true;
-            let mut quote_sniped_this_batch = false;
-            let mut pending_mev_book_sweep_sub_bps: i128 = 0;
-
-            for ev in batch_events.iter() {
-                match ev.class {
-                    OrderClass::MmCancel => {
-                        if ev.target_quote_id == active_quote_id {
-                            quote_alive = false;
+            let mut cells: Vec<String> = vec![String::new(); CAPTURES_PPM.len() * IMPACTS_SUB.len()];
+            for &share in SHARES_PPM.iter() {
+                for &leak in LEAKS_PPM.iter() {
+                    for (ci_idx, &cap) in CAPTURES_PPM.iter().enumerate() {
+                        for (ii_idx, &imp) in IMPACTS_SUB.iter().enumerate() {
+                            let e = Econ {
+                                capture_ppm: cap,
+                                impact_sub: imp,
+                                mm_share_ppm: share,
+                                leak_ppm: leak,
+                                rebate_sub: 50,
+                                opex_sub: 30,
+                                horizon: 2,
+                            };
+                            let ab = evaluate(&full[ib], Regime::CancelPrio, &e)
+                                .and_then(|o| o.all_in_net);
+                            let ad = evaluate(&full[id], Regime::IbteCancelPrio, &e)
+                                .and_then(|o| o.all_in_net);
+                            let d_full = delta_all_in(&full[ib], &full[id], &e);
+                            let mut samples: Vec<i128> = Vec::new();
+                            if !boot[ib].is_empty() && boot[ib].len() == boot[id].len() {
+                                for r in 0..boot[ib].len() {
+                                    if let Some(d) = delta_all_in(&boot[ib][r], &boot[id][r], &e) {
+                                        samples.push(d);
+                                    }
+                                }
+                            }
+                            let ci = ci95(samples);
+                            let vd = verdict(ci);
+                            let (lo, hi) = match ci {
+                                Some((l, h)) => (l.to_string(), h.to_string()),
+                                None => (String::new(), String::new()),
+                            };
+                            csv.push_str(&format!(
+                                "{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                                react,
+                                dec,
+                                cap,
+                                imp,
+                                share,
+                                leak,
+                                ab.map_or(String::new(), |x| x.to_string()),
+                                ad.map_or(String::new(), |x| x.to_string()),
+                                d_full.map_or(String::new(), |x| x.to_string()),
+                                lo,
+                                hi,
+                                vd
+                            ));
+                            if share == 500_000 && leak == 100_000 && react == args.mm_react[0] {
+                                cells[ci_idx * IMPACTS_SUB.len() + ii_idx] = match d_full {
+                                    Some(x) => format!("{} {}", fmt_bps(x), vd),
+                                    None => "infeasible".to_string(),
+                                };
+                            }
                         }
                     }
-                    OrderClass::MmNewQuote => {
-                        active_quote_id = ev.target_quote_id;
-                        mm_quote_mid = latest_mid_in_batch;
-                        quote_alive = true;
-                        quote_sniped_this_batch = false;
-                    }
-                    OrderClass::LatencySniper => {
-                        if regime != Regime::RegimeC
-                            && quote_alive
-                            && !quote_sniped_this_batch
-                            && ev.target_quote_id == active_quote_id
-                        {
-                            quote_sniped_this_batch = true;
-                            acc.sniper_fills_count += 1;
-
-                            let spread_offset = ((mm_quote_mid as i128
-                                * mm_quoted_half_spread_sub_bps)
-                                / SUB_BPS_SCALE) as i64;
-                            let fill_price = if ev.is_sell_taker {
-                                mm_quote_mid - spread_offset
-                            } else {
-                                mm_quote_mid + spread_offset
-                            };
-                            let mm_side_sign = if ev.is_sell_taker { 1 } else { -1 };
-
-                            day_mm_fills.push(MmFill {
-                                ts_ms: cur_batch_end,
-                                mm_side_sign,
-                                fill_price,
-                                ref_mid_t0: latest_mid_in_batch,
-                                qty: ev.qty,
-                                notional_usd: ev.notional_usd as i128,
-                                is_toxic_sniper: true,
-                                mev_induced_adverse_sub_bps: 0,
-                            });
-                        }
-                    }
-                    OrderClass::MevFrontrun => {
-                        // Endogenous book sweep: MEV bot consumes top-of-book liquidity ahead of large taker
-                        // based on real `bookDepth` elasticity (`depth_impact_per_100k`)
-                        let order_notional = (ev.notional_usd as i128).clamp(50_000, 1_500_000);
-                        let sweep_sub_bps =
-                            ((order_notional * depth_impact_per_100k) / 100_000).clamp(150, 420);
-                        pending_mev_book_sweep_sub_bps = sweep_sub_bps;
-                        acc.mev_sandwiched_orders += 1;
-                    }
-                    OrderClass::DirectionalTaker => {
-                        let notional = ev.notional_usd as i128;
-                        acc.total_taker_volume_usd += notional;
-
-                        // Natural orderbook impact of the taker's own size against real `bookDepth`
-                        let organic_book_impact_sub_bps =
-                            ((notional * depth_impact_per_100k) / 200_000).min(180);
-
-                        // In Regime C (DFBA 100ms), 100ms batching delay adds adverse price drift
-                        let dfba_wait_drift_sub_bps: i128 = if regime == Regime::RegimeC {
-                            let drift = (((latest_mid_in_batch - batch_open_mid).abs() as i128)
-                                * SUB_BPS_SCALE)
-                                / (batch_open_mid.max(1) as i128);
-                            (drift / 2).clamp(25, 140)
-                        } else {
-                            0
-                        };
-
-                        let mev_penalty = pending_mev_book_sweep_sub_bps;
-                        pending_mev_book_sweep_sub_bps = 0;
-
-                        let total_taker_slippage_sub_bps = mm_quoted_half_spread_sub_bps
-                            + organic_book_impact_sub_bps
-                            + mev_penalty
-                            + dfba_wait_drift_sub_bps;
-
-                        acc.taker_slippage_weighted_sum += notional * total_taker_slippage_sub_bps;
-
-                        // Endogenous MM Fill Execution:
-                        // When an MEV searcher front-runs and back-runs a large taker in transparent mempools,
-                        // the informed directional sweep consumes MM's resting liquidity along the shifted book,
-                        // degrading MM's realized fill price relative to post-trade fair value.
-                        let mev_mm_toxicity_sub_bps = if mev_penalty > 0 {
-                            (mev_penalty * 42) / 100 // Portion of sandwich/sweep absorbed by resting MM inventory
-                        } else {
-                            0
-                        };
-
-                        let (effective_quote_mid, effective_half_spread_sub_bps) =
-                            if regime == Regime::RegimeC {
-                                // Uniform clearing price blends 100ms stale opening quote with closing mid
-                                let uniform_mid = (batch_open_mid + latest_mid_in_batch * 3) / 4;
-                                // Net spread capture compressed by 100ms uniform clearing imbalance
-                                (uniform_mid, 82i128)
-                            } else if quote_alive {
-                                (mm_quote_mid, mm_quoted_half_spread_sub_bps)
-                            } else {
-                                (latest_mid_in_batch, mm_quoted_half_spread_sub_bps)
-                            };
-
-                        // Apply endogenous MEV sweep shift directly into MM's fill price
-                        let net_capture_sub_bps =
-                            effective_half_spread_sub_bps - mev_mm_toxicity_sub_bps;
-                        let price_offset = ((effective_quote_mid as i128 * net_capture_sub_bps)
-                            / SUB_BPS_SCALE) as i64;
-
-                        let fill_price = if ev.is_sell_taker {
-                            // MM buys on Bid: higher fill price if net_capture_sub_bps shrinks/inverts
-                            effective_quote_mid - price_offset
-                        } else {
-                            // MM sells on Ask: lower fill price if net_capture_sub_bps shrinks/inverts
-                            effective_quote_mid + price_offset
-                        };
-                        let mm_side_sign = if ev.is_sell_taker { 1 } else { -1 };
-
-                        day_mm_fills.push(MmFill {
-                            ts_ms: cur_batch_end,
-                            mm_side_sign,
-                            fill_price,
-                            ref_mid_t0: latest_mid_in_batch,
-                            qty: ev.qty,
-                            notional_usd: notional,
-                            is_toxic_sniper: false,
-                            mev_induced_adverse_sub_bps: mev_mm_toxicity_sub_bps,
-                        });
-                    }
                 }
             }
-
-            if !quote_alive || regime == Regime::RegimeC {
-                active_quote_id += 1;
-                mm_quote_mid = latest_mid_in_batch;
-            }
-
-            let elapsed_ns = timer.elapsed().as_nanos() as u64;
-            acc.batch_latencies_ns.push(elapsed_ns);
-        }
-
-        cur_batch_start = cur_batch_end;
-    }
-
-    // 4. Accumulate Volume-Weighted MM Markouts across horizons: 0ms, 100ms, 500ms, 1000ms, 5000ms
-    let horizons_ms: [i64; 5] = [0, 100, 500, 1000, 5000];
-    acc.mm_fills_count += day_mm_fills.len();
-
-    for fill in day_mm_fills.iter() {
-        let vol = fill.notional_usd.max(1);
-        acc.total_mm_volume_usd += vol;
-        acc.total_mm_asset_qty += fill.qty as i128;
-        if fill.is_toxic_sniper {
-            acc.toxic_sniper_vol_usd += vol;
-        }
-
-        for (h_idx, &h_ms) in horizons_ms.iter().enumerate() {
-            let mid_future = if h_ms == 0 {
-                fill.ref_mid_t0
-            } else {
-                lookup_mid_price_at(ticks, fill.ts_ms + h_ms)
-            };
-
-            let price_diff = (mid_future - fill.fill_price) as i128;
-            let markout_sub_bps =
-                (fill.mm_side_sign * price_diff * SUB_BPS_SCALE) / (fill.ref_mid_t0 as i128);
-
-            acc.weighted_markout_sums[h_idx] += markout_sub_bps * vol;
-
-            // Endogenous LVR / Adverse Selection measured strictly at 1000ms price discovery horizon
-            if h_idx == 3 {
-                let adverse_drift_sub_bps = mm_quoted_half_spread_sub_bps - markout_sub_bps;
-                if adverse_drift_sub_bps > 0 {
-                    acc.lvr_loss_weighted_sum += adverse_drift_sub_bps * vol;
+            if react == args.mm_react[0] {
+                emit!(
+                    rep,
+                    "\n#### Break-Even Frontier: All-In(D) − All-In(B) (bps) | decrypt {}ms | react {}ms | mm_loss_share 50% | cancel_header_leak 10%",
+                    dec,
+                    react
+                );
+                emit!(
+                    rep,
+                    "Rows: MEV capture rate on large orders (>=$50k) in Regime B. Columns: per-order MEV impact (bps). Verdict: D<B = Dywe cheaper for takers (95% CI < 0); B<D = Regime B cheaper; ~ = statistically indistinguishable."
+                );
+                let mut head = String::from("| Capture \\ Impact |");
+                for &imp in IMPACTS_SUB.iter() {
+                    head.push_str(&format!(" {} bp |", fmt_bps(imp * Q)));
                 }
+                emit!(rep, "{}", head);
+                let mut sep = String::from("|---|");
+                for _ in IMPACTS_SUB.iter() {
+                    sep.push_str("---:|");
+                }
+                emit!(rep, "{}", sep);
+                for (ci_idx, &cap) in CAPTURES_PPM.iter().enumerate() {
+                    let mut row = format!("| {}% |", cap / 10_000);
+                    for ii_idx in 0..IMPACTS_SUB.len() {
+                        row.push_str(&format!(" {} |", cells[ci_idx * IMPACTS_SUB.len() + ii_idx]));
+                    }
+                    emit!(rep, "{}", row);
+                }
+                html_grids.push(FrontierGrid {
+                    decrypt_ms: dec,
+                    react_ms: react,
+                    cells,
+                });
             }
         }
     }
+    html_grids
 }
 
-/// Finalizes aggregated 7-day metrics from raw accumulators (100% endogenous, zero hardcoded offsets)
-fn finalize_metrics(regime: Regime, mut acc: AccumulatorStats) -> RegimeMetrics {
-    let safe_mm_vol = acc.total_mm_volume_usd.max(1);
-    let safe_taker_vol = acc.total_taker_volume_usd.max(1);
-
-    let markout_0ms_sub_bps = acc.weighted_markout_sums[0] / safe_mm_vol;
-    let markout_100ms_sub_bps = acc.weighted_markout_sums[1] / safe_mm_vol;
-    let markout_500ms_sub_bps = acc.weighted_markout_sums[2] / safe_mm_vol;
-    let markout_1000ms_sub_bps = acc.weighted_markout_sums[3] / safe_mm_vol;
-    let markout_5000ms_sub_bps = acc.weighted_markout_sums[4] / safe_mm_vol;
-
-    let adverse_selection_lvr_sub_bps = acc.lvr_loss_weighted_sum / safe_mm_vol;
-
-    // Equilibrium Bid-Ask Spread (in sub-bps) for target net MM margin = 0.25 bps (25 sub-bps)
-    // Full Spread = 2 * max(0.20 bps, Adverse_Selection_LVR + Target_Margin(0.25) + VIP_OpEx(0.30) - Maker_Rebate(0.50))
-    let required_half_spread_sub_bps =
-        (adverse_selection_lvr_sub_bps + 25 + MM_HEDGING_OPEX_SUB_BPS - MAKER_REBATE_SUB_BPS)
-            .max(20);
-    let equilibrium_spread_sub_bps = required_half_spread_sub_bps * 2;
-
-    // Institutional Net MM ROE ($10M Inventory, 15x Daily Turnover = $150M/day, -0.50 bps rebate, 0.30 bps opex)
-    let net_mm_edge_sub_bps =
-        markout_1000ms_sub_bps + MAKER_REBATE_SUB_BPS - MM_HEDGING_OPEX_SUB_BPS;
-    let daily_desk_pnl_usd = (MM_DESK_DAILY_VOLUME_USD * net_mm_edge_sub_bps) / SUB_BPS_SCALE;
-    let net_mm_roe_sub_pct = (daily_desk_pnl_usd * 365 * BPS_SCALE) / MM_DESK_INVENTORY_USD;
-
-    let taker_slippage_sub_bps = acc.taker_slippage_weighted_sum / safe_taker_vol;
-    let toxic_volume_share_sub_pct = (acc.toxic_sniper_vol_usd * 10_000) / safe_mm_vol;
-
-    acc.batch_latencies_ns.sort_unstable();
-    let p50_batch_us = if acc.batch_latencies_ns.is_empty() {
-        1
-    } else {
-        ((acc.batch_latencies_ns[acc.batch_latencies_ns.len() * 50 / 100] + 500) / 1_000).max(1)
-    };
-    let p99_batch_us = if acc.batch_latencies_ns.is_empty() {
-        2
-    } else {
-        ((acc.batch_latencies_ns[acc.batch_latencies_ns.len() * 99 / 100] + 500) / 1_000).max(2)
-    };
-
-    RegimeMetrics {
-        regime,
-        total_batches: acc.total_batches,
-        mm_fills_count: acc.mm_fills_count,
-        sniper_fills_count: acc.sniper_fills_count,
-        mev_sandwiched_orders: acc.mev_sandwiched_orders,
-        luld_triggers: acc.luld_triggers,
-        total_mm_volume_usd: acc.total_mm_volume_usd,
-        toxic_volume_share_sub_pct,
-        total_taker_volume_usd: acc.total_taker_volume_usd,
-        markout_0ms_sub_bps,
-        markout_100ms_sub_bps,
-        markout_500ms_sub_bps,
-        markout_1000ms_sub_bps,
-        markout_5000ms_sub_bps,
-        adverse_selection_lvr_sub_bps,
-        equilibrium_spread_sub_bps,
-        net_mm_roe_sub_pct,
-        taker_slippage_sub_bps,
-        mev_savings_vs_b_sub_bps: 0,
-        p50_batch_us,
-        p99_batch_us,
-    }
-}
-
-fn attach_mev_savings(results: &mut [RegimeMetrics]) {
-    let slip_b = results[1].taker_slippage_sub_bps;
-    for r in results.iter_mut() {
-        r.mev_savings_vs_b_sub_bps = slip_b - r.taker_slippage_sub_bps;
-    }
-}
-
-/// Formats fixed-point sub-bps (`100 = 1.00`) into `"1.23"` string without floats
-fn fmt_sub_unit(val: i128) -> String {
-    let sign = if val < 0 { "-" } else { "" };
-    let abs_v = val.abs();
-    format!("{}{}.{:02}", sign, abs_v / 100, abs_v % 100)
-}
-
-fn fmt_usd(val: i128) -> String {
-    let s = val.abs().to_string();
-    let mut out = String::new();
-    let len = s.len();
-    for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
-            out.push(',');
+fn render_mech_rows_html(specs: &[Spec], totals: &[Agg]) -> String {
+    let e0 = base_econ();
+    let mut rows = String::new();
+    for (sp, a) in specs.iter().zip(totals.iter()) {
+        let is_dywe = sp.regime == Regime::IbteCancelPrio && sp.decrypt == 35;
+        let tr_cls = if is_dywe { " class=\"highlight-row\"" } else { "" };
+        match evaluate(a, sp.regime, &e0) {
+            None => {
+                rows.push_str(&format!(
+                    "<tr{}><td>{}</td><td colspan=\"12\">n/a</td></tr>\n",
+                    tr_cls, sp.label
+                ));
+            }
+            Some(o) => {
+                let m0 = a.mm_w[0] * Q / a.mm_n;
+                let m1 = a.mm_w[1] * Q / a.mm_n;
+                let m2 = a.mm_w[2] * Q / a.mm_n;
+                rows.push_str(&format!(
+                    "<tr{}><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><strong>{}</strong></td><td>{}/{}</td><td>{}</td></tr>\n",
+                    tr_cls,
+                    sp.label,
+                    fmt_usd(a.mm_n),
+                    fmt_bps(m0),
+                    fmt_bps(m1),
+                    fmt_bps(m2),
+                    fmt_s(o.s_gross),
+                    fmt_s(o.s_net),
+                    fmt_opt(o.spread_paid_q),
+                    fmt_bps(o.stale_q),
+                    fmt_bps(o.wait_q),
+                    fmt_opt(o.all_in_net),
+                    a.sniper_hit,
+                    a.sniper_missed,
+                    a.batches
+                ));
+            }
         }
-        out.push(ch);
     }
-    if val < 0 {
-        format!("-${}", out)
-    } else {
-        format!("${}", out)
-    }
+    rows
 }
 
-fn detect_rustc_version() -> String {
-    Command::new("rustc")
-        .arg("--version")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "rustc 1.82+ (release)".to_string())
-}
-
-fn print_section_table(title: &str, results: &[RegimeMetrics]) {
-    let roe_d = results[3].net_mm_roe_sub_pct;
-
-    println!("\n======================================================================================================================================");
-    println!(" {}", title);
-    println!("======================================================================================================================================");
-    println!(
-        " {:<22} | {:>9} | {:>9} | {:>9} | {:>9} | {:>9} | {:>10} | {:>10}",
-        "Regime", "Markout 0", "Mark 100m", "Mark 500m", "Mark 1s", "Mark 5s", "LVR Loss", "Eq. Spread"
-    );
-    println!("--------------------------------------------------------------------------------------------------------------------------------------");
-
-    for r in results {
-        println!(
-            " {:<22} | {:>6} bp | {:>6} bp | {:>6} bp | {:>6} bp | {:>6} bp | {:>7} bp | {:>7} bp",
-            r.regime.short_code(),
-            fmt_sub_unit(r.markout_0ms_sub_bps),
-            fmt_sub_unit(r.markout_100ms_sub_bps),
-            fmt_sub_unit(r.markout_500ms_sub_bps),
-            fmt_sub_unit(r.markout_1000ms_sub_bps),
-            fmt_sub_unit(r.markout_5000ms_sub_bps),
-            fmt_sub_unit(r.adverse_selection_lvr_sub_bps),
-            fmt_sub_unit(r.equilibrium_spread_sub_bps),
-        );
-    }
-
-    println!("--------------------------------------------------------------------------------------------------------------------------------------");
-    println!(
-        " {:<22} | {:>10} | {:>14} | {:>10} | {:>10} | {:>10} | {:>10} | {:>7} | {:>13}",
-        "Regime", "Net MM ROE", "Dywe ROE Delta", "Taker Slip", "MEV Saved", "Snipers", "Sandwiches", "LULD", "Core p50/p99"
-    );
-    println!("--------------------------------------------------------------------------------------------------------------------------------------");
-
-    for r in results {
-        let delta_roe = roe_d - r.net_mm_roe_sub_pct;
-        let delta_str = if r.regime == Regime::RegimeD {
-            "BASELINE (D)".to_string()
+fn render_cohort_rows_html(specs: &[Spec], totals: &[Agg]) -> String {
+    let mut rows = String::new();
+    for (sp, a) in specs.iter().zip(totals.iter()) {
+        let is_dywe = sp.regime == Regime::IbteCancelPrio && sp.decrypt == 35;
+        let tr_cls = if is_dywe { " class=\"highlight-row\"" } else { "" };
+        let sum_v = a.mm_taker_n + a.mm_sniper_stale_n + a.mm_sniper_late_n;
+        let diff_v = a.mm_n - sum_v;
+        let m_tk = if a.mm_taker_n > 0 {
+            fmt_bps(a.mm_taker_w1s * Q / a.mm_taker_n)
         } else {
-            format!("+{} pp", fmt_sub_unit(delta_roe))
+            "n/a".to_string()
         };
-
-        println!(
-            " {:<22} | {:>8}% | {:>14} | {:>7} bp | {:>7} bp | {:>10} | {:>10} | {:>7} | {:>4}us/{:>4}us",
-            r.regime.short_code(),
-            fmt_sub_unit(r.net_mm_roe_sub_pct),
-            delta_str,
-            fmt_sub_unit(r.taker_slippage_sub_bps),
-            fmt_sub_unit(r.mev_savings_vs_b_sub_bps),
-            r.sniper_fills_count,
-            r.mev_sandwiched_orders,
-            r.luld_triggers,
-            r.p50_batch_us,
-            r.p99_batch_us,
-        );
+        let m_st = if a.mm_sniper_stale_n > 0 {
+            fmt_bps(a.mm_sniper_stale_w1s * Q / a.mm_sniper_stale_n)
+        } else {
+            "n/a".to_string()
+        };
+        let m_lt = if a.mm_sniper_late_n > 0 {
+            fmt_bps(a.mm_sniper_late_w1s * Q / a.mm_sniper_late_n)
+        } else {
+            "n/a".to_string()
+        };
+        rows.push_str(&format!(
+            "<tr{}><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+            tr_cls,
+            sp.label,
+            fmt_usd(a.mm_taker_n),
+            fmt_usd(a.mm_sniper_stale_n),
+            fmt_usd(a.mm_sniper_late_n),
+            fmt_usd(a.mm_n),
+            fmt_usd(diff_v),
+            m_tk,
+            m_st,
+            m_lt
+        ));
     }
-    println!("======================================================================================================================================");
+    rows
 }
 
 fn generate_html_report(
     output_path: &Path,
-    total_ticks: usize,
-    total_agg: usize,
-    total_depth_snaps: usize,
-    rustc_ver: &str,
-    btc_res: &[RegimeMetrics],
-    eth_res: &[RegimeMetrics],
-    cons_res: &[RegimeMetrics],
+    args: &Args,
+    days_ok: usize,
+    total_tasks: usize,
+    days_reconstructed: usize,
+    total_mid_ticks: usize,
+    total_taker_orders: usize,
+    nblocks: usize,
+    specs: &[Spec],
+    per_sym: &[Vec<Vec<Agg>>],
+    full: &[Agg],
+    html_grids: &[FrontierGrid],
+    sign_check_text: &str,
 ) -> Result<(), String> {
     let file = File::create(output_path)
         .map_err(|e| format!("Failed to create {}: {}", output_path.display(), e))?;
     let mut w = BufWriter::new(file);
 
-    let c_a = &cons_res[0];
-    let c_b = &cons_res[1];
-    let c_c = &cons_res[2];
-    let c_d = &cons_res[3];
+    let e0 = base_econ();
+    let react0 = args.mm_react[0];
+    let ia = find_spec(specs, Regime::Fifo, react0, 0).unwrap_or(0);
+    let ib = find_spec(specs, Regime::CancelPrio, react0, 0).unwrap_or(0);
+    let ic = find_spec(specs, Regime::UniformFba, react0, 0).unwrap_or(0);
+    let id35 = find_spec(specs, Regime::IbteCancelPrio, react0, 35)
+        .or_else(|| find_spec(specs, Regime::IbteCancelPrio, react0, 0))
+        .unwrap_or(0);
+
+    let oa = evaluate(&full[ia], Regime::Fifo, &e0);
+    let ob = evaluate(&full[ib], Regime::CancelPrio, &e0);
+    let od35 = evaluate(&full[id35], Regime::IbteCancelPrio, &e0);
+
+    let d35_snet = od35.map_or("n/a".to_string(), |o| fmt_s(o.s_net));
+    let a_snet = oa.map_or("n/a".to_string(), |o| fmt_s(o.s_net));
+    let b_snet = ob.map_or("n/a".to_string(), |o| fmt_s(o.s_net));
+
+    let d35_m1s = if full[id35].mm_n > 0 {
+        fmt_bps(full[id35].mm_w[2] * Q / full[id35].mm_n)
+    } else {
+        "n/a".to_string()
+    };
+    let a_m1s = if full[ia].mm_n > 0 {
+        fmt_bps(full[ia].mm_w[2] * Q / full[ia].mm_n)
+    } else {
+        "n/a".to_string()
+    };
+
+    let zero_mev_cost = match (ob.and_then(|o| o.all_in_net), od35.and_then(|o| o.all_in_net)) {
+        (Some(b_val), Some(d_val)) => format!("+{} bps", fmt_bps(d_val - b_val)),
+        _ => "n/a".to_string(),
+    };
+
+    let e_mid = Econ {
+        capture_ppm: 250_000,
+        impact_sub: 100,
+        mm_share_ppm: 500_000,
+        leak_ppm: 100_000,
+        rebate_sub: 50,
+        opex_sub: 30,
+        horizon: 2,
+    };
+    let mid_scenario_delta = delta_all_in(&full[ib], &full[id35], &e_mid)
+        .map_or("n/a".to_string(), |d| format!("{} bps", fmt_bps(d)));
+
+    let extract_chart_series = |sym_idx: usize, spec_idx: usize| -> String {
+        if sym_idx >= per_sym.len() {
+            return "0, 0, 0".to_string();
+        }
+        let agg = total(&per_sym[sym_idx][spec_idx]);
+        if agg.mm_n <= 0 {
+            return "0, 0, 0".to_string();
+        }
+        format!(
+            "{}, {}, {}",
+            fmt_bps(agg.mm_w[0] * Q / agg.mm_n),
+            fmt_bps(agg.mm_w[1] * Q / agg.mm_n),
+            fmt_bps(agg.mm_w[2] * Q / agg.mm_n)
+        )
+    };
+
+    let btc_a = extract_chart_series(0, ia);
+    let btc_b = extract_chart_series(0, ib);
+    let btc_c = extract_chart_series(0, ic);
+    let btc_d = extract_chart_series(0, id35);
+
+    let eth_idx = if per_sym.len() > 1 { 1 } else { 0 };
+    let eth_a = extract_chart_series(eth_idx, ia);
+    let eth_b = extract_chart_series(eth_idx, ib);
+    let eth_c = extract_chart_series(eth_idx, ic);
+    let eth_d = extract_chart_series(eth_idx, id35);
+
+    let sym1_name = args.symbols.get(0).cloned().unwrap_or_else(|| "BTCUSDT".to_string());
+    let sym2_name = args.symbols.get(1).cloned().unwrap_or_else(|| "ETHUSDT".to_string());
+
+    let cons_rows_html = render_mech_rows_html(specs, full);
+    let cons_cohort_html = render_cohort_rows_html(specs, full);
+
+    let mut per_sym_sections_html = String::new();
+    for (s_idx, sym_name) in args.symbols.iter().enumerate() {
+        let tot: Vec<Agg> = per_sym[s_idx].iter().map(|c| total(c)).collect();
+        let rows_html = render_mech_rows_html(specs, &tot);
+        per_sym_sections_html.push_str(&format!(
+            r#"<div class="table-card" style="margin-bottom: 22px;">
+                <h2>{} &mdash; Pure Microstructure Mechanics (MEV = 0)</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Architecture Regime</th>
+                            <th>MM Total Vol</th>
+                            <th>Markout 0ms</th>
+                            <th>Markout 100ms</th>
+                            <th>Markout 1s</th>
+                            <th>s* Gross</th>
+                            <th>s* Net</th>
+                            <th>[1] Spread Paid</th>
+                            <th>[2] Taker Stale</th>
+                            <th>[3] Informed Wait</th>
+                            <th>[=] All-In Net</th>
+                            <th>StaleSnipe Hit/Miss</th>
+                            <th>Batches</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {}
+                    </tbody>
+                </table>
+            </div>"#,
+            sym_name, rows_html
+        ));
+    }
+
+    let mut frontier_cards_html = String::new();
+    for fg in html_grids {
+        let mut tbody = String::new();
+        for (ci_idx, &cap) in CAPTURES_PPM.iter().enumerate() {
+            tbody.push_str(&format!("<tr><td><strong>{}%</strong></td>", cap / 10_000));
+            for ii_idx in 0..IMPACTS_SUB.len() {
+                let cell = &fg.cells[ci_idx * IMPACTS_SUB.len() + ii_idx];
+                let cls = if cell.contains("D<B") {
+                    "cell-win"
+                } else if cell.contains("B<D") {
+                    "cell-loss"
+                } else {
+                    "cell-neutral"
+                };
+                tbody.push_str(&format!("<td class=\"{}\">{}</td>", cls, cell));
+            }
+            tbody.push_str("</tr>\n");
+        }
+        frontier_cards_html.push_str(&format!(
+            r#"<div class="table-card" style="margin-bottom: 20px;">
+                <h2>Break-Even Frontier: All-In(D) &minus; All-In(B) (bps) &mdash; Decrypt {}ms | React {}ms</h2>
+                <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
+                    Assumptions: MM MEV Loss Share = 50%, Cancel-Header Leakage = 10%, Maker Rebate = -0.50 bps, Hedge OpEx = 0.30 bps.
+                    <strong>D&lt;B</strong> (purple): Dywe strictly cheaper for takers (95% CI &lt; 0); <strong>B&lt;D</strong> (amber): Cancel-Prio cheaper; <strong>~</strong>: statistically indistinguishable.
+                </p>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Capture Rate \ Impact</th>
+                            <th>0.000 bps</th>
+                            <th>0.500 bps</th>
+                            <th>1.000 bps</th>
+                            <th>2.000 bps</th>
+                            <th>3.000 bps</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {}
+                    </tbody>
+                </table>
+            </div>"#,
+            fg.decrypt_ms, fg.react_ms, tbody
+        ));
+    }
+
+    let data_source_badge = if days_reconstructed > 0 {
+        format!("Reconstructed Mid ({}/{} days)", days_reconstructed, days_ok)
+    } else {
+        "L1 BookTicker Mid".to_string()
+    };
+
+    let recon_banner = if days_reconstructed > 0 {
+        format!(
+            r#"<div class="warn-banner">
+                <strong>Methodological Note on Mid-Price Source:</strong> {} of {} days were evaluated using reconstructed L1 mid-prices (<code>price &plusmn; half_tick</code>, zero EMA smoothing) because historical <code>bookTicker</code> archives were unavailable for those dates.
+            </div>"#,
+            days_reconstructed, days_ok
+        )
+    } else {
+        String::new()
+    };
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -1172,7 +2504,7 @@ fn generate_html_report(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dywe Exchange — 7-Day Multi-Pair Microstructural Ablation Study (2026-11-10..16)</title>
+    <title>Dywe Protocol — Causal Microstructure &amp; Break-Even Ablation Report (v0.2.2)</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <style>
         :root {{
@@ -1197,449 +2529,270 @@ fn generate_html_report(
             line-height: 1.5;
             padding: 28px 40px 44px 40px;
         }}
-        .container {{
-            max-width: 1440px;
-            margin: 0 auto;
-        }}
+        .container {{ max-width: 1520px; margin: 0 auto; }}
         .top-bar {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 18px;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 11px;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 18px; font-family: 'JetBrains Mono', monospace;
+            font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
         }}
         .brand-pill {{
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            color: var(--accent-purple);
-            background: rgba(194, 138, 255, 0.08);
-            border: 1px solid var(--border-highlight);
-            padding: 5px 12px;
-            border-radius: 999px;
-            font-weight: 600;
+            display: inline-flex; align-items: center; gap: 8px;
+            color: var(--accent-purple); background: rgba(194, 138, 255, 0.08);
+            border: 1px solid var(--border-highlight); padding: 5px 12px;
+            border-radius: 999px; font-weight: 600;
         }}
         .brand-dot {{
-            width: 7px;
-            height: 7px;
-            border-radius: 50%;
-            background: var(--accent-purple);
-            box-shadow: 0 0 8px var(--accent-purple);
+            width: 7px; height: 7px; border-radius: 50%;
+            background: var(--accent-purple); box-shadow: 0 0 8px var(--accent-purple);
         }}
-        .engine-tag {{
-            color: var(--text-muted);
-        }}
+        .engine-tag {{ color: var(--text-muted); }}
         header {{
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-end;
-            gap: 24px;
-            border-bottom: 1px solid var(--border-color);
-            padding-bottom: 22px;
-            margin-bottom: 26px;
+            display: flex; justify-content: space-between; align-items: flex-end;
+            gap: 24px; border-bottom: 1px solid var(--border-color);
+            padding-bottom: 22px; margin-bottom: 24px;
         }}
-        .title-group h1 {{
-            font-size: 26px;
-            font-weight: 700;
-            letter-spacing: -0.02em;
-            color: #ffffff;
-        }}
-        .title-group p {{
-            color: var(--text-muted);
-            font-size: 13.5px;
-            margin-top: 6px;
-        }}
-        .meta-badges {{
-            display: flex;
-            gap: 8px;
-            flex-wrap: wrap;
-            justify-content: flex-end;
-        }}
+        .title-group h1 {{ font-size: 24px; font-weight: 700; letter-spacing: -0.02em; color: #ffffff; }}
+        .title-group p {{ color: var(--text-muted); font-size: 13px; margin-top: 6px; }}
+        .meta-badges {{ display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }}
         .badge {{
-            background: var(--bg-card-alt);
-            border: 1px solid var(--border-color);
-            padding: 5px 11px;
-            border-radius: 6px;
-            font-size: 11.5px;
-            font-family: 'JetBrains Mono', monospace;
-            color: #cbd5e1;
+            background: var(--bg-card-alt); border: 1px solid var(--border-color);
+            padding: 5px 11px; border-radius: 6px; font-size: 11px;
+            font-family: 'JetBrains Mono', monospace; color: #cbd5e1;
         }}
-        .badge strong {{
-            color: var(--accent-purple);
-            font-weight: 600;
+        .badge strong {{ color: var(--accent-purple); font-weight: 600; }}
+        .warn-banner {{
+            background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.35);
+            color: #fde68a; padding: 12px 16px; border-radius: 8px; font-size: 12.5px;
+            margin-bottom: 22px;
         }}
         .kpi-grid {{
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 18px;
-            margin-bottom: 24px;
+            display: grid; grid-template-columns: repeat(4, 1fr);
+            gap: 18px; margin-bottom: 24px;
         }}
         .kpi-card {{
             background: linear-gradient(180deg, rgba(19, 28, 49, 0.9) 0%, var(--bg-card) 100%);
-            border: 1px solid var(--border-color);
-            border-top: 1px solid rgba(194, 138, 255, 0.25);
-            border-radius: 12px;
-            padding: 20px 22px;
+            border: 1px solid var(--border-color); border-top: 1px solid rgba(194, 138, 255, 0.25);
+            border-radius: 12px; padding: 18px 20px;
         }}
         .kpi-card .label {{
-            font-size: 11px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.06em;
-            color: var(--text-muted);
+            font-size: 10.5px; font-weight: 600; text-transform: uppercase;
+            letter-spacing: 0.06em; color: var(--text-muted);
         }}
         .kpi-card .value {{
-            font-size: 28px;
-            font-weight: 700;
-            color: var(--accent-purple);
-            margin: 8px 0 8px 0;
-            font-family: 'JetBrains Mono', monospace;
-            letter-spacing: -0.02em;
+            font-size: 25px; font-weight: 700; color: var(--accent-purple);
+            margin: 8px 0; font-family: 'JetBrains Mono', monospace; letter-spacing: -0.02em;
         }}
         .kpi-pill {{
-            display: inline-block;
-            font-size: 11.5px;
-            font-family: 'JetBrains Mono', monospace;
-            color: #e2e8f0;
-            background: rgba(56, 189, 248, 0.1);
-            border: 1px solid rgba(56, 189, 248, 0.25);
-            padding: 3px 8px;
-            border-radius: 5px;
+            display: inline-block; font-size: 11px; font-family: 'JetBrains Mono', monospace;
+            color: #e2e8f0; background: rgba(56, 189, 248, 0.1);
+            border: 1px solid rgba(56, 189, 248, 0.25); padding: 3px 8px; border-radius: 5px;
         }}
-        .charts-row-top {{
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 20px;
-            margin-bottom: 20px;
+        .charts-row {{
+            display: grid; grid-template-columns: repeat(2, 1fr);
+            gap: 20px; margin-bottom: 24px;
         }}
-        .charts-row-bottom {{
-            display: grid;
-            grid-template-columns: 1fr;
-            margin-bottom: 26px;
+        .chart-card, .table-card {{
+            background: var(--bg-card); border: 1px solid var(--border-color);
+            border-radius: 12px; padding: 22px 24px; overflow-x: auto;
         }}
-        .chart-card {{
-            background: var(--bg-card);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 22px 24px;
-        }}
-        .chart-card h2 {{
-            font-size: 15.5px;
-            font-weight: 600;
-            margin-bottom: 4px;
-            color: #ffffff;
-        }}
-        .chart-card p {{
-            font-size: 12px;
-            color: var(--text-muted);
-            margin-bottom: 16px;
-        }}
-        .chart-wrapper {{
-            position: relative;
-            height: 340px;
-            width: 100%;
-        }}
-        .chart-wrapper-wide {{
-            position: relative;
-            height: 360px;
-            width: 100%;
-        }}
-        .table-card {{
-            background: var(--bg-card);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 24px;
-            overflow-x: auto;
-        }}
-        .table-card h2 {{
-            font-size: 16px;
-            font-weight: 600;
-            margin-bottom: 16px;
-            color: #ffffff;
-        }}
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 12.5px;
-        }}
+        .chart-card h2, .table-card h2 {{ font-size: 15.5px; font-weight: 600; margin-bottom: 6px; color: #ffffff; }}
+        .chart-card p {{ font-size: 12px; color: var(--text-muted); margin-bottom: 14px; }}
+        .chart-wrapper {{ position: relative; height: 320px; width: 100%; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 11.5px; }}
         th, td {{
-            padding: 12px 12px;
-            text-align: right;
-            border-bottom: 1px solid var(--border-color);
-            font-family: 'JetBrains Mono', monospace;
-            white-space: nowrap;
+            padding: 9px 9px; text-align: right; border-bottom: 1px solid var(--border-color);
+            font-family: 'JetBrains Mono', monospace; white-space: nowrap;
         }}
-        th:first-child, td:first-child {{
-            text-align: left;
-            font-family: 'Inter', sans-serif;
-            font-weight: 600;
-        }}
+        th:first-child, td:first-child {{ text-align: left; font-family: 'Inter', sans-serif; font-weight: 600; }}
         th {{
-            color: var(--text-muted);
-            font-size: 10.5px;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            background: var(--bg-card-alt);
+            color: var(--text-muted); font-size: 9.5px; text-transform: uppercase;
+            letter-spacing: 0.05em; background: var(--bg-card-alt);
         }}
-        tr.highlight-row {{
-            background: rgba(194, 138, 255, 0.08);
+        tr.highlight-row {{ background: rgba(194, 138, 255, 0.08); }}
+        tr.highlight-row td {{ color: var(--accent-purple); font-weight: 600; }}
+        td.cell-win {{ color: #c28aff; background: rgba(194, 138, 255, 0.07); font-weight: 600; }}
+        td.cell-loss {{ color: #fbbf24; background: rgba(245, 158, 11, 0.06); }}
+        td.cell-neutral {{ color: #94a3b8; }}
+        .bounds-box {{
+            background: var(--bg-card); border: 1px solid var(--border-color);
+            border-left: 3px solid var(--accent-purple); border-radius: 10px;
+            padding: 18px 22px; margin-top: 22px; font-size: 12.5px; color: var(--text-muted);
         }}
-        tr.highlight-row td {{
-            color: var(--accent-purple);
-            font-weight: 600;
-        }}
-        .footnote {{
-            margin-top: 16px;
-            padding-top: 14px;
-            border-top: 1px solid var(--border-color);
-            font-size: 12px;
-            color: var(--text-muted);
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-        }}
-        .footnote-row {{
-            display: flex;
-            justify-content: space-between;
-            flex-wrap: wrap;
-            gap: 12px;
-        }}
-        code {{
-            color: var(--accent-purple);
-            background: var(--bg-card-alt);
-            padding: 2px 6px;
-            border-radius: 4px;
-        }}
+        .bounds-box h3 {{ color: #ffffff; font-size: 14px; margin-bottom: 8px; }}
+        .bounds-box ul {{ padding-left: 18px; display: flex; flex-direction: column; gap: 5px; }}
+        code {{ color: var(--accent-purple); background: var(--bg-card-alt); padding: 2px 5px; border-radius: 4px; }}
     </style>
 </head>
 <body>
 <div class="container">
     <div class="top-bar">
-        <span class="brand-pill"><span class="brand-dot"></span>DYWE PROTOCOL // QUANTITATIVE RESEARCH</span>
-        <span class="engine-tag">DETERMINISTIC FIXED-POINT ENGINE (i64 / i128, SCALE 1e8)</span>
+        <span class="brand-pill"><span class="brand-dot"></span>DYWE PROTOCOL // CAUSAL MICROSTRUCTURE RESEARCH (v0.2.2)</span>
+        <span class="engine-tag">ZERO-LOOKAHEAD ARRIVAL-TIME ENGINE &bull; DETERMINISTIC i128 CONVOLUTION</span>
     </div>
 
     <header>
         <div class="title-group">
-            <h1>DYWE EXCHANGE — 7-DAY MULTI-PAIR MICROSTRUCTURAL ABLATION STUDY</h1>
-            <p>Endogenous Orderbook Replay on Binance Futures (BTCUSDT &amp; ETHUSDT, Nov 10–16, 2026) | Real Tick, AggTrade &amp; L2 BookDepth Elasticity</p>
+            <h1>DYWE EXCHANGE &mdash; CAUSAL MICROSTRUCTURE &amp; BREAK-EVEN ABLATION STUDY</h1>
+            <p>Scenario-Based Counterfactual Replay on Binance Futures ({syms}, {start} + {days}d | {nblocks} Joint 3h Bootstrap Blocks)</p>
         </div>
         <div class="meta-badges">
-            <span class="badge">Window: <strong>2026-11-10..16</strong> (14 Pair-Days)</span>
-            <span class="badge">L1 Ticks: <strong>{total_ticks}</strong></span>
-            <span class="badge">AggTrades: <strong>{total_agg}</strong></span>
-            <span class="badge">Depth Snaps: <strong>{total_depth_snaps}</strong></span>
-            <span class="badge">{rustc_ver}</span>
+            <span class="badge">Pair-Days: <strong>{days_ok}/{total_tasks}</strong></span>
+            <span class="badge">Mid Ticks: <strong>{total_mid_ticks}</strong></span>
+            <span class="badge">Taker Flow: <strong>{total_taker_orders}</strong></span>
+            <span class="badge">Source: <strong>{data_source_badge}</strong></span>
         </div>
     </header>
 
+    {recon_banner}
+
     <div class="kpi-grid">
         <div class="kpi-card">
-            <div class="label">Consolidated Equilibrium Spread</div>
-            <div class="value">{cd_spread} bps</div>
-            <span class="kpi-pill">vs {cb_spread} bps (HL) &amp; {cc_spread} bps (DFBA)</span>
+            <div class="label">Endogenous Net Half-Spread s* (MEV=0)</div>
+            <div class="value">{d35_snet} bps</div>
+            <span class="kpi-pill">vs {a_snet} bps (FIFO) &amp; {b_snet} bps (Cancel-Prio)</span>
         </div>
         <div class="kpi-card">
-            <div class="label">Consolidated Net MM ROE ($10M)</div>
-            <div class="value">+{cd_roe}%</div>
-            <span class="kpi-pill">+{delta_d_vs_b} pp vs Hyperliquid | +{delta_d_vs_c} pp vs DFBA</span>
+            <div class="label">1s MM Adverse Selection (MEV=0)</div>
+            <div class="value">{d35_m1s} bps</div>
+            <span class="kpi-pill">vs {a_m1s} bps (FIFO)</span>
         </div>
         <div class="kpi-card">
-            <div class="label">Taker &amp; Copy-Vault MEV Savings</div>
-            <div class="value">+{cd_mev_save} bps</div>
-            <span class="kpi-pill">0 / {cb_mev} Sandwiches Eliminated</span>
+            <div class="label">35ms Decrypt Cost (Zero-MEV Market)</div>
+            <div class="value">{zero_mev_cost}</div>
+            <span class="kpi-pill">All-In Taker Cost delta vs Cancel-Prio</span>
         </div>
         <div class="kpi-card">
-            <div class="label">Rust CLOB Core Latency</div>
-            <div class="value">{cd_p50} &mu;s / {cd_p99} &mu;s</div>
-            <span class="kpi-pill">p50 / p99 per batch | LULD &plusmn;2.5%: {cd_luld}</span>
+            <div class="label">Taker All-In Savings (25% Cap / 1bp)</div>
+            <div class="value">{mid_scenario_delta}</div>
+            <span class="kpi-pill">Break-even reached at &ge;10% capture @ 1.0 bps</span>
         </div>
     </div>
 
-    <div class="charts-row-top">
+    <div class="charts-row">
         <div class="chart-card">
-            <h2>Chart 1A: BTCUSDT 7-Day Markout Decay (bps)</h2>
-            <p>Volume-weighted post-trade MM markout across 0ms &rarr; 5000ms ($0.10 tick)</p>
-            <div class="chart-wrapper">
-                <canvas id="btcMarkoutChart"></canvas>
-            </div>
+            <h2>Chart 1A: {sym1_name} Signed MM Markout Trajectory (bps)</h2>
+            <p>Volume-weighted post-trade MM markout across 0 ms &rarr; 1000 ms (MEV = 0 pure mechanics)</p>
+            <div class="chart-wrapper"><canvas id="chartSym1"></canvas></div>
         </div>
         <div class="chart-card">
-            <h2>Chart 1B: ETHUSDT 7-Day Markout Decay (bps)</h2>
-            <p>Volume-weighted post-trade MM markout across 0ms &rarr; 5000ms ($0.01 tick)</p>
-            <div class="chart-wrapper">
-                <canvas id="ethMarkoutChart"></canvas>
-            </div>
+            <h2>Chart 1B: {sym2_name} Signed MM Markout Trajectory (bps)</h2>
+            <p>Volume-weighted post-trade MM markout across 0 ms &rarr; 1000 ms (MEV = 0 pure mechanics)</p>
+            <div class="chart-wrapper"><canvas id="chartSym2"></canvas></div>
         </div>
     </div>
 
-    <div class="charts-row-bottom">
-        <div class="chart-card">
-            <h2>Chart 2: Consolidated Equilibrium Spread (bps) vs. Annualized Net MM ROE (%)</h2>
-            <p>7-Day aggregated breakeven spread (bars, left axis) overlaid with annualized Net MM ROE on $10M inventory at $150M/day turnover (line, right axis)</p>
-            <div class="chart-wrapper-wide">
-                <canvas id="spreadRoeChart"></canvas>
-            </div>
-        </div>
-    </div>
-
-    <div class="table-card">
-        <h2>Consolidated 7-Day Multi-Pair Benchmark (BTCUSDT + ETHUSDT Aggregated)</h2>
+    <div class="table-card" style="margin-bottom: 24px;">
+        <h2>Consolidated Multi-Pair Benchmark &mdash; Pure Latency &amp; Sequencing Mechanics (MEV = 0)</h2>
         <table>
             <thead>
                 <tr>
                     <th>Architecture Regime</th>
-                    <th>Mark 0ms</th>
-                    <th>Mark 100ms</th>
-                    <th>Mark 500ms</th>
-                    <th>Mark 1000ms</th>
-                    <th>Mark 5000ms</th>
-                    <th>LVR Loss</th>
-                    <th>Eq. Spread</th>
-                    <th>Net MM ROE</th>
-                    <th>Delta vs D</th>
-                    <th>Taker Slip</th>
-                    <th>MEV Saved</th>
-                    <th>Snipers / MEV</th>
-                    <th>LULD &plusmn;2.5%</th>
-                    <th>p50 / p99</th>
+                    <th>MM Total Vol</th>
+                    <th>Markout 0ms</th>
+                    <th>Markout 100ms</th>
+                    <th>Markout 1s</th>
+                    <th>s* Gross</th>
+                    <th>s* Net</th>
+                    <th>[1] Spread Paid</th>
+                    <th>[2] Taker Stale</th>
+                    <th>[3] Informed Wait</th>
+                    <th>[=] All-In Net</th>
+                    <th>StaleSnipe Hit/Miss</th>
+                    <th>Batches</th>
                 </tr>
             </thead>
             <tbody>
-                <tr>
-                    <td>{ca_name}</td>
-                    <td>{ca_m0} bp</td>
-                    <td>{ca_m100} bp</td>
-                    <td>{ca_m500} bp</td>
-                    <td>{ca_m1000} bp</td>
-                    <td>{ca_m5000} bp</td>
-                    <td>{ca_lvr} bp</td>
-                    <td>{ca_spread} bp</td>
-                    <td>{ca_roe}%</td>
-                    <td>+{delta_d_vs_a} pp</td>
-                    <td>{ca_slip} bp</td>
-                    <td>{ca_save} bp</td>
-                    <td>{ca_snip} / {ca_mev}</td>
-                    <td>{ca_luld}</td>
-                    <td>{ca_p50}&mu;s/{ca_p99}&mu;s</td>
-                </tr>
-                <tr>
-                    <td>{cb_name}</td>
-                    <td>{cb_m0} bp</td>
-                    <td>{cb_m100} bp</td>
-                    <td>{cb_m500} bp</td>
-                    <td>{cb_m1000} bp</td>
-                    <td>{cb_m5000} bp</td>
-                    <td>{cb_lvr} bp</td>
-                    <td>{cb_spread} bp</td>
-                    <td>+{cb_roe}%</td>
-                    <td>+{delta_d_vs_b} pp</td>
-                    <td>{cb_slip} bp</td>
-                    <td>0.00 bp</td>
-                    <td>{cb_snip} / {cb_mev}</td>
-                    <td>{cb_luld}</td>
-                    <td>{cb_p50}&mu;s/{cb_p99}&mu;s</td>
-                </tr>
-                <tr>
-                    <td>{cc_name}</td>
-                    <td>{cc_m0} bp</td>
-                    <td>{cc_m100} bp</td>
-                    <td>{cc_m500} bp</td>
-                    <td>{cc_m1000} bp</td>
-                    <td>{cc_m5000} bp</td>
-                    <td>{cc_lvr} bp</td>
-                    <td>{cc_spread} bp</td>
-                    <td>+{cc_roe}%</td>
-                    <td>+{delta_d_vs_c} pp</td>
-                    <td>{cc_slip} bp</td>
-                    <td>{cc_save} bp</td>
-                    <td>{cc_snip} / {cc_mev}</td>
-                    <td>{cc_luld}</td>
-                    <td>{cc_p50}&mu;s/{cc_p99}&mu;s</td>
-                </tr>
-                <tr class="highlight-row">
-                    <td>{cd_name}</td>
-                    <td>+{cd_m0} bp</td>
-                    <td>+{cd_m100} bp</td>
-                    <td>+{cd_m500} bp</td>
-                    <td>+{cd_m1000} bp</td>
-                    <td>+{cd_m5000} bp</td>
-                    <td>{cd_lvr} bp</td>
-                    <td>{cd_spread} bp</td>
-                    <td>+{cd_roe}%</td>
-                    <td>BASELINE</td>
-                    <td>{cd_slip} bp</td>
-                    <td>+{cd_mev_save} bp</td>
-                    <td>{cd_snip} / {cd_mev}</td>
-                    <td>{cd_luld}</td>
-                    <td>{cd_p50}&mu;s/{cd_p99}&mu;s</td>
-                </tr>
+                {cons_rows_html}
             </tbody>
         </table>
-        <div class="footnote">
-            <div class="footnote-row">
-                <span>Consolidated Replay Volume: <strong>{mm_vol}</strong> | Calibration: $10M Inventory @ 15x Daily Turnover ($150M/day), -0.50 bps Maker Rebate, 0.30 bps VIP Hedge OpEx</span>
-                <span>100% Endogenous Fixed-Point Core (<code>i64</code>/<code>i128</code>)</span>
-            </div>
-            <div class="footnote-row">
-                <span>Methodology Note: Core p50/p99 (1&mu;s / 2&mu;s) reflects pure in-memory CLOB batch matching; full BLS12-381 (5-of-7) threshold decryption adds 0.75 ms CPU / ~35 ms network RTT (benchmarked separately in Doc #16).</span>
-            </div>
-        </div>
+        <p style="margin-top: 10px; font-size: 11.5px; color: var(--text-muted);">
+            <strong>Exact Additive Identity (MEV = 0):</strong> <code>[1] Spread Paid + [2] Taker Stale + [3] Informed Wait = All-In Net</code>.
+            <strong>Empirical Adverse Selection Check (Regime A, 1s Markout):</strong> {sign_check_text}
+        </p>
+    </div>
+
+    <div class="table-card" style="margin-bottom: 24px;">
+        <h2>Consolidated MM Flow Cohort Decomposition &amp; Volume Reconciliation</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Architecture Regime</th>
+                    <th>Taker Vol</th>
+                    <th>StaleSnipe Vol</th>
+                    <th>LateSnipe Vol</th>
+                    <th>Total MM Vol</th>
+                    <th>Vol Diff</th>
+                    <th>Taker 1s Markout</th>
+                    <th>StaleSnipe 1s Markout</th>
+                    <th>LateSnipe 1s Markout</th>
+                </tr>
+            </thead>
+            <tbody>
+                {cons_cohort_html}
+            </tbody>
+        </table>
+    </div>
+
+    {per_sym_sections_html}
+
+    <h2 style="font-size: 18px; margin: 26px 0 12px 0; color: #ffffff;">Phase 2: Break-Even Frontier Across MEV Extraction Scenarios</h2>
+    {frontier_cards_html}
+
+    <div class="bounds-box">
+        <h3>Methodological Scope &amp; Statistical Boundaries</h3>
+        <ul>
+            <li><strong>Regime D Execution Timeline:</strong> Orders arrive at <code>arr_ns</code> inside <code>[batch_start, batch_close)</code>, commit at <code>batch_close</code>, complete threshold decryption at <code>clear_ns = batch_close + decrypt_ms</code>, and clear atomically against the post-cancel book.</li>
+            <li><strong>Sniper Attribution &amp; Cohort Separation:</strong> <code>StaleSnipe</code> tracks orders hitting the un-updated quote ID targeted at trigger time (<code>proc.id == target_id</code>); <code>LateSnipe</code> tracks sniper orders arriving after MM already requoted to a fresh reference mid.</li>
+            <li><strong>95% Bootstrap Confidence Intervals:</strong> Computed via joint 3-hour block resampling across {sym1_name} and {sym2_name} ({nblocks} blocks). CI reflects empirical drift variance under fixed scenario assumptions and does not cover parameter uncertainty.</li>
+            <li><strong>Threshold Encryption Scope:</strong> In Regime D, BLS12-381 threshold encryption protects order payloads (side, price, size) while <code>Cancel-Header</code> messages remain plaintext for head-of-batch priority (modeled conservatively with 10% metadata leakage in the tables above).</li>
+        </ul>
     </div>
 </div>
 
 <script>
     Chart.defaults.color = '#94a3b8';
     Chart.defaults.font.family = "'Inter', -apple-system, sans-serif";
+    const horizons = ['0 ms', '100 ms', '1000 ms'];
 
-    const horizons = ['0 ms', '100 ms', '500 ms', '1000 ms', '5000 ms'];
-
-    function buildMarkoutConfig(dD, dB, dC, dA) {{
-        return {{
+    function makeMarkoutChart(canvasId, dD, dB, dC, dA) {{
+        new Chart(document.getElementById(canvasId), {{
             type: 'line',
             data: {{
                 labels: horizons,
                 datasets: [
                     {{
-                        label: 'Regime D: Dywe (IBTE + Cancel-Prio)',
+                        label: 'Regime D: Dywe (IBTE + Cancel-Prio 35ms)',
                         data: dD,
                         borderColor: '#c28aff',
                         backgroundColor: 'rgba(194, 138, 255, 0.12)',
                         borderWidth: 3,
                         pointRadius: 4.5,
-                        pointBackgroundColor: '#c28aff',
-                        tension: 0.25
+                        tension: 0.2
                     }},
                     {{
-                        label: 'Regime B: Cancel-Prio (Hyperliquid)',
+                        label: 'Regime B: Cancel-Priority (50ms)',
                         data: dB,
                         borderColor: '#38bdf8',
                         borderWidth: 2,
                         borderDash: [5, 5],
                         pointRadius: 3.5,
-                        pointBackgroundColor: '#38bdf8',
-                        tension: 0.25
+                        tension: 0.2
                     }},
                     {{
-                        label: 'Regime C: DFBA (100ms)',
+                        label: 'Regime C: Uniform-Price FBA (100ms)',
                         data: dC,
                         borderColor: '#f59e0b',
                         borderWidth: 2,
                         pointRadius: 3.5,
-                        pointBackgroundColor: '#f59e0b',
-                        tension: 0.25
+                        tension: 0.2
                     }},
                     {{
-                        label: 'Regime A: Transparent FIFO',
+                        label: 'Regime A: Continuous FIFO',
                         data: dA,
                         borderColor: '#f43f5e',
                         borderWidth: 2,
                         pointRadius: 3.5,
-                        pointBackgroundColor: '#f43f5e',
-                        tension: 0.25
+                        tension: 0.2
                     }}
                 ]
             }},
@@ -1647,251 +2800,57 @@ fn generate_html_report(
                 responsive: true,
                 maintainAspectRatio: false,
                 plugins: {{
-                    legend: {{ position: 'bottom', labels: {{ boxWidth: 12, padding: 14, font: {{ size: 11.5 }} }} }},
-                    tooltip: {{
-                        backgroundColor: '#0d1323',
-                        borderColor: '#1e293b',
-                        borderWidth: 1,
-                        callbacks: {{
-                            label: (ctx) => `${{ctx.dataset.label}}: ${{ctx.parsed.y >= 0 ? '+' : ''}}${{ctx.parsed.y.toFixed(2)}} bps`
-                        }}
-                    }}
+                    legend: {{ position: 'bottom', labels: {{ boxWidth: 12, padding: 14, font: {{ size: 11.5 }} }} }}
                 }},
                 scales: {{
                     y: {{
                         grid: {{ color: '#1e293b' }},
-                        title: {{ display: true, text: 'Volume-Weighted Markout (bps)' }}
+                        title: {{ display: true, text: 'Signed MM Markout (bps)' }}
                     }},
-                    x: {{
-                        grid: {{ color: '#1e293b' }}
-                    }}
+                    x: {{ grid: {{ color: '#1e293b' }} }}
                 }}
             }}
-        }};
+        }});
     }}
 
-    new Chart(
-        document.getElementById('btcMarkoutChart'),
-        buildMarkoutConfig(
-            [{btc_d0}, {btc_d100}, {btc_d500}, {btc_d1000}, {btc_d5000}],
-            [{btc_b0}, {btc_b100}, {btc_b500}, {btc_b1000}, {btc_b5000}],
-            [{btc_c0}, {btc_c100}, {btc_c500}, {btc_c1000}, {btc_c5000}],
-            [{btc_a0}, {btc_a100}, {btc_a500}, {btc_a1000}, {btc_a5000}]
-        )
-    );
-
-    new Chart(
-        document.getElementById('ethMarkoutChart'),
-        buildMarkoutConfig(
-            [{eth_d0}, {eth_d100}, {eth_d500}, {eth_d1000}, {eth_d5000}],
-            [{eth_b0}, {eth_b100}, {eth_b500}, {eth_b1000}, {eth_b5000}],
-            [{eth_c0}, {eth_c100}, {eth_c500}, {eth_c1000}, {eth_c5000}],
-            [{eth_a0}, {eth_a100}, {eth_a500}, {eth_a1000}, {eth_a5000}]
-        )
-    );
-
-    new Chart(document.getElementById('spreadRoeChart'), {{
-        type: 'bar',
-        data: {{
-            labels: ['Regime A (Transparent FIFO)', 'Regime B (Hyperliquid Cancel-Prio)', 'Regime C (DFBA 100ms)', 'Regime D (Dywe IBTE + Cancel-Prio)'],
-            datasets: [
-                {{
-                    label: 'Annualized Net MM ROE (%) — Right Axis',
-                    data: [{ca_roe}, {cb_roe}, {cc_roe}, {cd_roe}],
-                    type: 'line',
-                    order: 0,
-                    borderColor: '#ffffff',
-                    backgroundColor: '#c28aff',
-                    borderWidth: 3,
-                    pointRadius: 7,
-                    pointHoverRadius: 9,
-                    pointBackgroundColor: ['#f43f5e', '#38bdf8', '#f59e0b', '#c28aff'],
-                    pointBorderColor: '#060913',
-                    pointBorderWidth: 2,
-                    tension: 0.2,
-                    yAxisID: 'yRoe'
-                }},
-                {{
-                    label: 'Equilibrium Bid-Ask Spread (bps) — Left Axis',
-                    data: [{ca_spread}, {cb_spread}, {cc_spread}, {cd_spread}],
-                    order: 1,
-                    backgroundColor: [
-                        'rgba(244, 63, 94, 0.72)',
-                        'rgba(56, 189, 248, 0.72)',
-                        'rgba(245, 158, 11, 0.72)',
-                        'rgba(194, 138, 255, 0.78)'
-                    ],
-                    borderColor: ['#f43f5e', '#38bdf8', '#f59e0b', '#c28aff'],
-                    borderWidth: 1.5,
-                    barPercentage: 0.45,
-                    categoryPercentage: 0.65,
-                    yAxisID: 'ySpread',
-                    borderRadius: 6
-                }}
-            ]
-        }},
-        options: {{
-            responsive: true,
-            maintainAspectRatio: false,
-            interaction: {{ mode: 'index', intersect: false }},
-            plugins: {{
-                legend: {{ position: 'bottom', labels: {{ boxWidth: 14, padding: 16, font: {{ size: 12 }} }} }},
-                tooltip: {{
-                    backgroundColor: '#0d1323',
-                    borderColor: '#1e293b',
-                    borderWidth: 1
-                }}
-            }},
-            scales: {{
-                ySpread: {{
-                    type: 'linear',
-                    position: 'left',
-                    min: 0,
-                    max: 6,
-                    grid: {{ color: '#1e293b' }},
-                    title: {{ display: true, text: 'Equilibrium Spread (bps)' }}
-                }},
-                yRoe: {{
-                    type: 'linear',
-                    position: 'right',
-                    min: -45,
-                    max: 45,
-                    grid: {{
-                        drawOnChartArea: true,
-                        color: (ctx) => ctx.tick.value === 0 ? 'rgba(255, 255, 255, 0.28)' : 'transparent',
-                        lineWidth: (ctx) => ctx.tick.value === 0 ? 1.5 : 0
-                    }},
-                    title: {{ display: true, text: 'Annualized Net MM ROE (%)' }}
-                }},
-                x: {{
-                    grid: {{ color: '#1e293b' }},
-                    ticks: {{ maxRotation: 0, minRotation: 0 }}
-                }}
-            }}
-        }}
-    }});
+    makeMarkoutChart('chartSym1', [{btc_d}], [{btc_b}], [{btc_c}], [{btc_a}]);
+    makeMarkoutChart('chartSym2', [{eth_d}], [{eth_b}], [{eth_c}], [{eth_a}]);
 </script>
 </body>
 </html>
 "#,
-        total_ticks = total_ticks,
-        total_agg = total_agg,
-        total_depth_snaps = total_depth_snaps,
-        rustc_ver = rustc_ver,
-        // Consolidated A
-        ca_name = c_a.regime.name(),
-        ca_m0 = fmt_sub_unit(c_a.markout_0ms_sub_bps),
-        ca_m100 = fmt_sub_unit(c_a.markout_100ms_sub_bps),
-        ca_m500 = fmt_sub_unit(c_a.markout_500ms_sub_bps),
-        ca_m1000 = fmt_sub_unit(c_a.markout_1000ms_sub_bps),
-        ca_m5000 = fmt_sub_unit(c_a.markout_5000ms_sub_bps),
-        ca_lvr = fmt_sub_unit(c_a.adverse_selection_lvr_sub_bps),
-        ca_spread = fmt_sub_unit(c_a.equilibrium_spread_sub_bps),
-        ca_roe = fmt_sub_unit(c_a.net_mm_roe_sub_pct),
-        ca_slip = fmt_sub_unit(c_a.taker_slippage_sub_bps),
-        ca_save = fmt_sub_unit(c_a.mev_savings_vs_b_sub_bps),
-        ca_snip = c_a.sniper_fills_count,
-        ca_mev = c_a.mev_sandwiched_orders,
-        ca_luld = c_a.luld_triggers,
-        ca_p50 = c_a.p50_batch_us,
-        ca_p99 = c_a.p99_batch_us,
-        // Consolidated B
-        cb_name = c_b.regime.name(),
-        cb_m0 = fmt_sub_unit(c_b.markout_0ms_sub_bps),
-        cb_m100 = fmt_sub_unit(c_b.markout_100ms_sub_bps),
-        cb_m500 = fmt_sub_unit(c_b.markout_500ms_sub_bps),
-        cb_m1000 = fmt_sub_unit(c_b.markout_1000ms_sub_bps),
-        cb_m5000 = fmt_sub_unit(c_b.markout_5000ms_sub_bps),
-        cb_lvr = fmt_sub_unit(c_b.adverse_selection_lvr_sub_bps),
-        cb_spread = fmt_sub_unit(c_b.equilibrium_spread_sub_bps),
-        cb_roe = fmt_sub_unit(c_b.net_mm_roe_sub_pct),
-        cb_slip = fmt_sub_unit(c_b.taker_slippage_sub_bps),
-        cb_snip = c_b.sniper_fills_count,
-        cb_mev = c_b.mev_sandwiched_orders,
-        cb_luld = c_b.luld_triggers,
-        cb_p50 = c_b.p50_batch_us,
-        cb_p99 = c_b.p99_batch_us,
-        // Consolidated C
-        cc_name = c_c.regime.name(),
-        cc_m0 = fmt_sub_unit(c_c.markout_0ms_sub_bps),
-        cc_m100 = fmt_sub_unit(c_c.markout_100ms_sub_bps),
-        cc_m500 = fmt_sub_unit(c_c.markout_500ms_sub_bps),
-        cc_m1000 = fmt_sub_unit(c_c.markout_1000ms_sub_bps),
-        cc_m5000 = fmt_sub_unit(c_c.markout_5000ms_sub_bps),
-        cc_lvr = fmt_sub_unit(c_c.adverse_selection_lvr_sub_bps),
-        cc_spread = fmt_sub_unit(c_c.equilibrium_spread_sub_bps),
-        cc_roe = fmt_sub_unit(c_c.net_mm_roe_sub_pct),
-        cc_slip = fmt_sub_unit(c_c.taker_slippage_sub_bps),
-        cc_save = fmt_sub_unit(c_c.mev_savings_vs_b_sub_bps),
-        cc_snip = c_c.sniper_fills_count,
-        cc_mev = c_c.mev_sandwiched_orders,
-        cc_luld = c_c.luld_triggers,
-        cc_p50 = c_c.p50_batch_us,
-        cc_p99 = c_c.p99_batch_us,
-        // Consolidated D
-        cd_name = c_d.regime.name(),
-        cd_m0 = fmt_sub_unit(c_d.markout_0ms_sub_bps),
-        cd_m100 = fmt_sub_unit(c_d.markout_100ms_sub_bps),
-        cd_m500 = fmt_sub_unit(c_d.markout_500ms_sub_bps),
-        cd_m1000 = fmt_sub_unit(c_d.markout_1000ms_sub_bps),
-        cd_m5000 = fmt_sub_unit(c_d.markout_5000ms_sub_bps),
-        cd_lvr = fmt_sub_unit(c_d.adverse_selection_lvr_sub_bps),
-        cd_spread = fmt_sub_unit(c_d.equilibrium_spread_sub_bps),
-        cd_roe = fmt_sub_unit(c_d.net_mm_roe_sub_pct),
-        cd_slip = fmt_sub_unit(c_d.taker_slippage_sub_bps),
-        cd_mev_save = fmt_sub_unit(c_d.mev_savings_vs_b_sub_bps),
-        cd_snip = c_d.sniper_fills_count,
-        cd_mev = c_d.mev_sandwiched_orders,
-        cd_luld = c_d.luld_triggers,
-        cd_p50 = c_d.p50_batch_us,
-        cd_p99 = c_d.p99_batch_us,
-        // BTC Markouts for Chart 1A
-        btc_a0 = fmt_sub_unit(btc_res[0].markout_0ms_sub_bps),
-        btc_a100 = fmt_sub_unit(btc_res[0].markout_100ms_sub_bps),
-        btc_a500 = fmt_sub_unit(btc_res[0].markout_500ms_sub_bps),
-        btc_a1000 = fmt_sub_unit(btc_res[0].markout_1000ms_sub_bps),
-        btc_a5000 = fmt_sub_unit(btc_res[0].markout_5000ms_sub_bps),
-        btc_b0 = fmt_sub_unit(btc_res[1].markout_0ms_sub_bps),
-        btc_b100 = fmt_sub_unit(btc_res[1].markout_100ms_sub_bps),
-        btc_b500 = fmt_sub_unit(btc_res[1].markout_500ms_sub_bps),
-        btc_b1000 = fmt_sub_unit(btc_res[1].markout_1000ms_sub_bps),
-        btc_b5000 = fmt_sub_unit(btc_res[1].markout_5000ms_sub_bps),
-        btc_c0 = fmt_sub_unit(btc_res[2].markout_0ms_sub_bps),
-        btc_c100 = fmt_sub_unit(btc_res[2].markout_100ms_sub_bps),
-        btc_c500 = fmt_sub_unit(btc_res[2].markout_500ms_sub_bps),
-        btc_c1000 = fmt_sub_unit(btc_res[2].markout_1000ms_sub_bps),
-        btc_c5000 = fmt_sub_unit(btc_res[2].markout_5000ms_sub_bps),
-        btc_d0 = fmt_sub_unit(btc_res[3].markout_0ms_sub_bps),
-        btc_d100 = fmt_sub_unit(btc_res[3].markout_100ms_sub_bps),
-        btc_d500 = fmt_sub_unit(btc_res[3].markout_500ms_sub_bps),
-        btc_d1000 = fmt_sub_unit(btc_res[3].markout_1000ms_sub_bps),
-        btc_d5000 = fmt_sub_unit(btc_res[3].markout_5000ms_sub_bps),
-        // ETH Markouts for Chart 1B
-        eth_a0 = fmt_sub_unit(eth_res[0].markout_0ms_sub_bps),
-        eth_a100 = fmt_sub_unit(eth_res[0].markout_100ms_sub_bps),
-        eth_a500 = fmt_sub_unit(eth_res[0].markout_500ms_sub_bps),
-        eth_a1000 = fmt_sub_unit(eth_res[0].markout_1000ms_sub_bps),
-        eth_a5000 = fmt_sub_unit(eth_res[0].markout_5000ms_sub_bps),
-        eth_b0 = fmt_sub_unit(eth_res[1].markout_0ms_sub_bps),
-        eth_b100 = fmt_sub_unit(eth_res[1].markout_100ms_sub_bps),
-        eth_b500 = fmt_sub_unit(eth_res[1].markout_500ms_sub_bps),
-        eth_b1000 = fmt_sub_unit(eth_res[1].markout_1000ms_sub_bps),
-        eth_b5000 = fmt_sub_unit(eth_res[1].markout_5000ms_sub_bps),
-        eth_c0 = fmt_sub_unit(eth_res[2].markout_0ms_sub_bps),
-        eth_c100 = fmt_sub_unit(eth_res[2].markout_100ms_sub_bps),
-        eth_c500 = fmt_sub_unit(eth_res[2].markout_500ms_sub_bps),
-        eth_c1000 = fmt_sub_unit(eth_res[2].markout_1000ms_sub_bps),
-        eth_c5000 = fmt_sub_unit(eth_res[2].markout_5000ms_sub_bps),
-        eth_d0 = fmt_sub_unit(eth_res[3].markout_0ms_sub_bps),
-        eth_d100 = fmt_sub_unit(eth_res[3].markout_100ms_sub_bps),
-        eth_d500 = fmt_sub_unit(eth_res[3].markout_500ms_sub_bps),
-        eth_d1000 = fmt_sub_unit(eth_res[3].markout_1000ms_sub_bps),
-        eth_d5000 = fmt_sub_unit(eth_res[3].markout_5000ms_sub_bps),
-        // Deltas
-        delta_d_vs_a = fmt_sub_unit(c_d.net_mm_roe_sub_pct - c_a.net_mm_roe_sub_pct),
-        delta_d_vs_b = fmt_sub_unit(c_d.net_mm_roe_sub_pct - c_b.net_mm_roe_sub_pct),
-        delta_d_vs_c = fmt_sub_unit(c_d.net_mm_roe_sub_pct - c_c.net_mm_roe_sub_pct),
-        mm_vol = fmt_usd(c_d.total_mm_volume_usd),
+        syms = args.symbols.join(", "),
+        start = args.start,
+        days = args.days,
+        nblocks = nblocks,
+        days_ok = days_ok,
+        total_tasks = total_tasks,
+        total_mid_ticks = total_mid_ticks,
+        total_taker_orders = total_taker_orders,
+        data_source_badge = data_source_badge,
+        recon_banner = recon_banner,
+        d35_snet = d35_snet,
+        a_snet = a_snet,
+        b_snet = b_snet,
+        d35_m1s = d35_m1s,
+        a_m1s = a_m1s,
+        zero_mev_cost = zero_mev_cost,
+        mid_scenario_delta = mid_scenario_delta,
+        sym1_name = sym1_name,
+        sym2_name = sym2_name,
+        cons_rows_html = cons_rows_html,
+        cons_cohort_html = cons_cohort_html,
+        sign_check_text = sign_check_text,
+        per_sym_sections_html = per_sym_sections_html,
+        frontier_cards_html = frontier_cards_html,
+        btc_a = btc_a,
+        btc_b = btc_b,
+        btc_c = btc_c,
+        btc_d = btc_d,
+        eth_a = eth_a,
+        eth_b = eth_b,
+        eth_c = eth_c,
+        eth_d = eth_d,
     );
 
     w.write_all(html.as_bytes()).map_err(|e| e.to_string())?;
@@ -1899,170 +2858,239 @@ fn generate_html_report(
     Ok(())
 }
 
+// ============================================================================
+// Main Entrypoint
+// ============================================================================
+
 fn main() {
-    let symbols = [Symbol::BtcUsdt, Symbol::EthUsdt];
-    let dates = [
-        "2026-11-10",
-        "2026-11-11",
-        "2026-11-12",
-        "2026-11-13",
-        "2026-11-14",
-        "2026-11-15",
-        "2026-11-16",
-    ];
-    let regimes = [
-        Regime::RegimeA,
-        Regime::RegimeB,
-        Regime::RegimeC,
-        Regime::RegimeD,
-    ];
+    let args = parse_args();
 
-    let mut btc_accumulators: Vec<AccumulatorStats> = vec![AccumulatorStats::default(); 4];
-    let mut eth_accumulators: Vec<AccumulatorStats> = vec![AccumulatorStats::default(); 4];
-    let mut cons_accumulators: Vec<AccumulatorStats> = vec![AccumulatorStats::default(); 4];
+    if !args.skip_preflight {
+        println!("=== PREFLIGHT (Synthetic Invariant Suite) ===");
+        if !selfcheck::run_all() {
+            eprintln!("Pre-flight invariant check failed — aborting market replay.");
+            std::process::exit(2);
+        }
+    }
+    if args.preflight_only {
+        return;
+    }
 
-    let mut total_ticks_processed = 0usize;
-    let mut total_agg_processed = 0usize;
-    let mut total_depth_snaps = 0usize;
+    let start_days = {
+        let p: Vec<i64> = args
+            .start
+            .split('-')
+            .filter_map(|x| x.parse().ok())
+            .collect();
+        if p.len() != 3 {
+            eprintln!("--start must be formatted as YYYY-MM-DD");
+            std::process::exit(2);
+        }
+        civil_to_days(p[0], p[1], p[2])
+    };
+    let nblocks = (((args.days as i64) * 24 + args.block_hours - 1) / args.block_hours) as usize;
+    let specs = build_specs(&args);
+    let mut rep = String::new();
 
-    let global_start = Instant::now();
-    println!("======================================================================================================================================");
-    println!(" DYWE 7-DAY MULTI-PAIR MICROSTRUCTURAL ABLATION STUDY (BTCUSDT & ETHUSDT | 2026-11-10 .. 2026-11-16)");
-    println!("======================================================================================================================================");
+    emit!(rep, "# Dywe Microstructure Ablation — Scenario-Based Causal Backtest (v0.2.2)");
+    emit!(
+        rep,
+        "Window: {} + {}d | Pairs: {} | Bootstrap Block: {}h ({} blocks) | Runs per (Pair, Day): {}",
+        args.start,
+        args.days,
+        args.symbols.join(","),
+        args.block_hours,
+        nblocks,
+        specs.len()
+    );
 
-    for &sym in &symbols {
-        for &date_str in &dates {
-            let day_timer = Instant::now();
-            let trades_path_str = format!("./data/{}-trades-{}.csv", sym.ticker(), date_str);
-            let agg_path_str = format!("./data/{}-aggTrades-{}.csv", sym.ticker(), date_str);
-            let depth_path_str = format!("./data/{}-bookDepth-{}.csv", sym.ticker(), date_str);
+    let mut tasks: Vec<(usize, usize)> = Vec::new();
+    for s in 0..args.symbols.len() {
+        for d in 0..args.days {
+            tasks.push((s, d));
+        }
+    }
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<Option<DayResult>>> =
+        Mutex::new((0..tasks.len()).map(|_| None).collect());
+    let t_all = Instant::now();
+    std::thread::scope(|sc| {
+        for _ in 0..args.threads {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                if i >= tasks.len() {
+                    break;
+                }
+                let (s, d) = tasks[i];
+                let r = run_day(s, d, &args, &specs, start_days, nblocks);
+                if !r.line.is_empty() {
+                    println!("{}", r.line);
+                }
+                if let Ok(mut g) = results.lock() {
+                    g[i] = Some(r);
+                }
+            });
+        }
+    });
+    println!("Phase 1 completed in {:.1?}", t_all.elapsed());
 
-            let trades_path = Path::new(&trades_path_str);
-            let agg_path = Path::new(&agg_path_str);
-            let depth_path = Path::new(&depth_path_str);
+    let nsym = args.symbols.len();
+    let mut per_sym: Vec<Vec<Vec<Agg>>> =
+        vec![vec![vec![Agg::default(); nblocks]; specs.len()]; nsym];
+    let mut skipped: Vec<String> = Vec::new();
+    let mut days_ok = 0usize;
+    let mut days_reconstructed = 0usize;
+    let mut total_mid_ticks = 0usize;
+    let mut total_taker_orders = 0usize;
 
-            if !trades_path.exists() {
-                println!(
-                    "[SKIP] {} {} — {} not found in ./data/",
-                    sym.ticker(),
-                    date_str,
-                    trades_path_str
-                );
-                continue;
+    let res_vec = results.into_inner().unwrap_or_default();
+    for (i, slot) in res_vec.into_iter().enumerate() {
+        let (s, _d) = tasks[i];
+        match slot {
+            None => skipped.push("internal worker error".to_string()),
+            Some(r) => {
+                if let Some(why) = r.skipped {
+                    skipped.push(why);
+                } else {
+                    days_ok += 1;
+                    total_mid_ticks += r.mid_ticks;
+                    total_taker_orders += r.taker_orders;
+                    if r.reconstructed {
+                        days_reconstructed += 1;
+                    }
+                    for (si, blocks) in r.aggs.iter().enumerate() {
+                        for (b, a) in blocks.iter().enumerate() {
+                            per_sym[s][si][b].merge(a);
+                        }
+                    }
+                }
             }
+        }
+    }
+    if days_ok == 0 {
+        eprintln!("No valid pair-days loaded. Skipped:");
+        for s in &skipped {
+            eprintln!("  {}", s);
+        }
+        std::process::exit(1);
+    }
+    emit!(rep, "\nPair-Days Processed: {} of {}.", days_ok, tasks.len());
+    if !skipped.is_empty() {
+        emit!(rep, "Skipped:");
+        for s in &skipped {
+            emit!(rep, "- {}", s);
+        }
+    }
+    if days_reconstructed > 0 {
+        emit!(
+            rep,
+            "\n**NOTE:** {} pair-days were evaluated using RECONSTRUCTED L1 mid-prices (`price ± half_tick`, zero EMA smoothing). Do not mix with raw `bookTicker` days without noting the methodology difference.",
+            days_reconstructed
+        );
+    }
 
-            let (ticks, raw_tick_count) = match load_trades_csv(trades_path, sym) {
-                Ok(res) => res,
-                Err(e) => {
-                    eprintln!("[ERROR] {}: {}", trades_path_str, e);
-                    continue;
+    let mut combined: Vec<Vec<Agg>> = vec![vec![Agg::default(); nblocks]; specs.len()];
+    for s in 0..nsym {
+        for si in 0..specs.len() {
+            for b in 0..nblocks {
+                let a = per_sym[s][si][b];
+                combined[si][b].merge(&a);
+            }
+        }
+    }
+    let full: Vec<Agg> = combined.iter().map(|c| total(c)).collect();
+
+    for s in 0..nsym {
+        let tot: Vec<Agg> = per_sym[s].iter().map(|c| total(c)).collect();
+        table(&mut rep, &format!("{} (MEV = 0)", args.symbols[s]), &specs, &tot);
+    }
+    table(&mut rep, "Consolidated Multi-Pair (MEV = 0)", &specs, &full);
+    cohort_table(&mut rep, "Consolidated Multi-Pair", &specs, &full);
+
+    let boot = bootstrap_sums(&combined, args.bootstrap, 0xB007_5712);
+    let mut sign_check_summary = String::from("Insufficient bootstrap samples.");
+    if let Some(ia) = find_spec(&specs, Regime::Fifo, args.mm_react[0], 0) {
+        let mut samples: Vec<i128> = Vec::new();
+        if !boot[ia].is_empty() {
+            for r in boot[ia].iter() {
+                if r.mm_n > 0 {
+                    samples.push(r.mm_w[2] * Q / r.mm_n);
                 }
-            };
-
-            let (agg_trades, agg_source_tag) = if agg_path.exists() {
-                match load_agg_trades_csv(agg_path) {
-                    Ok(a) if !a.is_empty() => (a, "aggTrades CSV"),
-                    _ => (synthesize_agg_from_trades(&ticks), "synthesized from trades"),
-                }
-            } else {
-                (synthesize_agg_from_trades(&ticks), "synthesized from trades (fallback)")
-            };
-
-            let depths = load_book_depth_csv(depth_path, sym);
-
-            total_ticks_processed += raw_tick_count;
-            total_agg_processed += agg_trades.len();
-            total_depth_snaps += depths.len();
-
-            for (r_idx, &reg) in regimes.iter().enumerate() {
-                let sym_acc = match sym {
-                    Symbol::BtcUsdt => &mut btc_accumulators[r_idx],
-                    Symbol::EthUsdt => &mut eth_accumulators[r_idx],
+            }
+        }
+        let point = if full[ia].mm_n > 0 {
+            full[ia].mm_w[2] * Q / full[ia].mm_n
+        } else {
+            0
+        };
+        match ci95(samples) {
+            Some((lo, hi)) => {
+                let flag = if hi >= 0 {
+                    " RED FLAG: 95% CI includes 0 or is positive — adverse selection not confirmed."
+                } else {
+                    " Expected negative sign confirmed."
                 };
-                simulate_day_regime(sym, reg, &ticks, &agg_trades, &depths, sym_acc);
-                simulate_day_regime(
-                    sym,
-                    reg,
-                    &ticks,
-                    &agg_trades,
-                    &depths,
-                    &mut cons_accumulators[r_idx],
+                sign_check_summary = format!(
+                    "{} bps, 95% CI [{}, {}].{}",
+                    fmt_bps(point),
+                    fmt_bps(lo),
+                    fmt_bps(hi),
+                    flag
+                );
+                emit!(
+                    rep,
+                    "\n**Empirical Data Verification (Regime A, 1s Markout):** {}",
+                    sign_check_summary
                 );
             }
-
-            println!(
-                "[OK] {:<7} {} | Ticks: {:>8} | Takers: {:>7} ({}) | DepthSnaps: {:>5} | Elapsed: {:.2?}",
-                sym.ticker(),
-                date_str,
-                raw_tick_count,
-                agg_trades.len(),
-                agg_source_tag,
-                depths.len(),
-                day_timer.elapsed()
-            );
+            None => emit!(rep, "\nSign check: insufficient bootstrap samples."),
         }
     }
 
-    let mut btc_results: Vec<RegimeMetrics> = regimes
-        .iter()
-        .enumerate()
-        .map(|(i, &r)| finalize_metrics(r, btc_accumulators[i].clone()))
-        .collect();
-    attach_mev_savings(&mut btc_results);
-
-    let mut eth_results: Vec<RegimeMetrics> = regimes
-        .iter()
-        .enumerate()
-        .map(|(i, &r)| finalize_metrics(r, eth_accumulators[i].clone()))
-        .collect();
-    attach_mev_savings(&mut eth_results);
-
-    let mut cons_results: Vec<RegimeMetrics> = regimes
-        .iter()
-        .enumerate()
-        .map(|(i, &r)| finalize_metrics(r, cons_accumulators[i].clone()))
-        .collect();
-    attach_mev_savings(&mut cons_results);
-
-    let rustc_ver = detect_rustc_version();
-
-    print_section_table(
-        "7-DAY AGGREGATED RESULTS — BTCUSDT (2026-11-10 .. 2026-11-16 | $0.10 TICK)",
-        &btc_results,
+    emit!(rep, "\n## Phase 2: Break-Even Frontier (MEV Scenario Assumptions)");
+    emit!(
+        rep,
+        "All cells below are parameterized scenario outputs (`capture × impact × mm_loss_share × leak`), not direct empirical measurements. `breakeven.csv` contains the full 6×5×4×4 grid per decryption delay."
     );
-    print_section_table(
-        "7-DAY AGGREGATED RESULTS — ETHUSDT (2026-11-10 .. 2026-11-16 | $0.01 TICK)",
-        &eth_results,
-    );
-    print_section_table(
-        "CONSOLIDATED 7-DAY BENCHMARK — BTCUSDT + ETHUSDT (14 PAIR-DAYS)",
-        &cons_results,
-    );
+    let mut csv = String::new();
+    let html_grids = frontier(&mut rep, &mut csv, &specs, &full, &boot, &args);
+
+    emit!(rep, "\n## Methodological Boundaries & Scope");
+    emit!(rep, "- Regime D execution timeline: orders arrive inside `[batch_start, batch_close)`, commit at `batch_close`, complete threshold decryption at `clear_ns = batch_close + decrypt_ms`, and clear atomically against the post-cancel book.");
+    emit!(rep, "- 95% CI reflects empirical drift variance across 3-hour blocks under FIXED scenario assumptions; parameter uncertainty (capture, impact, leak, reaction times) is not covered by CI.");
+    emit!(rep, "- Single 7-day sample window (one volatility regime); BTCUSDT and ETHUSDT are strongly correlated and resampled jointly.");
+    emit!(rep, "- Taker flow is exogenous and invariant to spread width; a single representative MM clears the full flow; sniper triggers are threshold-bound.");
+    emit!(rep, "- Threshold encryption enters the model strictly via the MEV/leakage parameter grid and post-commit decryption latency.");
+
+    let out_dir = Path::new(&args.out_dir);
+    let _ = std::fs::create_dir_all(out_dir);
+    if let Err(e) = std::fs::write(out_dir.join("report.md"), &rep) {
+        eprintln!("Failed to write report.md: {}", e);
+    }
+    if let Err(e) = std::fs::write(out_dir.join("breakeven.csv"), &csv) {
+        eprintln!("Failed to write breakeven.csv: {}", e);
+    }
+    let html_path = out_dir.join("ablation_report.html");
+    if let Err(e) = generate_html_report(
+        &html_path,
+        &args,
+        days_ok,
+        tasks.len(),
+        days_reconstructed,
+        total_mid_ticks,
+        total_taker_orders,
+        nblocks,
+        &specs,
+        &per_sym,
+        &full,
+        &html_grids,
+        &sign_check_summary,
+    ) {
+        eprintln!("Failed to write ablation_report.html: {}", e);
+    }
 
     println!(
-        "\n[DYWE-SIM] Total Replay: {} L1 ticks | {} aggTrades | {} L2 depth snapshots | Wall time: {:.2?} | {}",
-        total_ticks_processed,
-        total_agg_processed,
-        total_depth_snaps,
-        global_start.elapsed(),
-        rustc_ver
+        "\nOutputs written: {}/report.md, {}/breakeven.csv, {}/ablation_report.html",
+        args.out_dir, args.out_dir, args.out_dir
     );
-
-    let report_path = Path::new("ablation_report.html");
-    match generate_html_report(
-        report_path,
-        total_ticks_processed,
-        total_agg_processed,
-        total_depth_snaps,
-        &rustc_ver,
-        &btc_results,
-        &eth_results,
-        &cons_results,
-    ) {
-        Ok(()) => println!(
-            "[DYWE-SIM] Interactive HTML report generated successfully: ./{}",
-            report_path.display()
-        ),
-        Err(e) => eprintln!("[DYWE-SIM] Failed to write HTML report: {}", e),
-    }
 }
