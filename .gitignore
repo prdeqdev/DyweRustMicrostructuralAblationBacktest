@@ -4,3 +4,6 @@
 .DS_Store
 data/*
 !data/.gitkeep
+data_l1/
+target/
+data/
