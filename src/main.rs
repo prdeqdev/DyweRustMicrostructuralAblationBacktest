@@ -1,12 +1,19 @@
-//! dywe-ablation-sim v0.3.1 — SCENARIO-BASED CAUSAL MICROSTRUCTURE BACKTEST.
+//! dywe-ablation-sim v0.3.3 — SCENARIO-BASED CAUSAL MICROSTRUCTURE BACKTEST.
 //!
-//! New in v0.3.1:
-//!   * `--pending-policy <hold|drop>` (default: `hold`): controls whether taker orders arriving
-//!     during an MM cancel-replace gap wait in `pending` until the fresh quote lands (`hold`) or
-//!     immediately expire like real IOC orders (`drop`).
-//!   * `--mid-mode <bidask|trade>` (default: `bidask`): when `bookTicker` is absent, reconstructs
-//!     L1 mid either from separate last aggressive buy (`ask`) and last aggressive sell (`bid`)
-//!     executions (`(bid + ask) / 2`), or from single-trade `price +/- half_tick` (`trade`).
+//! New in v0.3.3:
+//!   * `--d-batch-order <hl|cancel-first>` (default: `hl`): distinguishes pre-commit encrypted
+//!     mempool privacy from post-decrypt in-memory matching (`New/ALO -> Cancel -> Taker`),
+//!     allowing both apples-to-apples (`B=hl` vs `D=hl`) and `cancel-first` stress runs.
+//!   * `--wait-cohort <all|large>` (default: `all`): ensures strict volume-weighted linear
+//!     additivity across all 4 All-In Net cost components over a single denominator (`tk_n`).
+//!   * Fixes `Regime C (FBA)` sniper attribution so late snipers arriving after MM requotes
+//!     are recorded as `sniper_late_fresh` rather than stale `sniper_hit`.
+//!   * Automatic selection-bias warning in `report.md`, `ablation_report.html`, and
+//!     `breakeven.csv` whenever `|dropped_USD%(B) - dropped_USD%(D)| >= 1.0%`.
+//!   * Natural sub-millisecond MM jitter `[0..999_999 ns]` allowing physical batch-boundary
+//!     splits between `Cancel` and `New`.
+//!   * Parameterizes `--rebate-sub`, `--opex-sub`, and `--large-usd` via CLI, adds `Large Vol %`
+//!     and `Cancel-Batch Large %` columns, fixes CSS wildcard reset, and expands tests to 14.
 
 #![allow(dead_code)]
 
@@ -132,6 +139,23 @@ impl PendingPolicy {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatchOrder {
+    /// Class 0: Cancel, Class 1: New / Taker / Sniper (by arrival time).
+    CancelFirst,
+    /// Post-only first: Class 0: New (ALO/post-only), Class 1: Cancel, Class 2: Taker / Sniper.
+    Hl,
+}
+
+impl BatchOrder {
+    fn as_str(self) -> &'static str {
+        match self {
+            BatchOrder::CancelFirst => "cancel-first",
+            BatchOrder::Hl => "hl",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MidMode {
     BidAskProxy,
     TradeHalfTick,
@@ -143,6 +167,40 @@ impl MidMode {
             MidMode::BidAskProxy => "bidask",
             MidMode::TradeHalfTick => "trade",
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitCohort {
+    /// Volume-weighted waiting drift over ALL executed takers (denominator = tk_n).
+    All,
+    /// Volume-weighted waiting drift over large takers (>= large_usd, denominator = tk_inf_n).
+    Large,
+}
+
+impl WaitCohort {
+    fn as_str(self) -> &'static str {
+        match self {
+            WaitCohort::All => "all",
+            WaitCohort::Large => "large",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Debug)]
+struct ProxyDiag {
+    total_obs: usize,
+    crossed_obs: usize,
+    valid_spread_obs: usize,
+    spread_sum_sub: i128,
+}
+
+impl ProxyDiag {
+    fn merge(&mut self, o: &ProxyDiag) {
+        self.total_obs += o.total_obs;
+        self.crossed_obs += o.crossed_obs;
+        self.valid_spread_obs += o.valid_spread_obs;
+        self.spread_sum_sub += o.spread_sum_sub;
     }
 }
 
@@ -160,6 +218,7 @@ struct Cfg {
     sniper_clip_usd: i64,
     large_usd: i64,
     pending_policy: PendingPolicy,
+    batch_order: BatchOrder,
     seed: u64,
     log: bool,
 }
@@ -178,6 +237,7 @@ fn default_cfg() -> Cfg {
         sniper_clip_usd: 25_000,
         large_usd: 50_000,
         pending_policy: PendingPolicy::Hold,
+        batch_order: BatchOrder::Hl,
         seed: 0xD15E_0001,
         log: false,
     }
@@ -305,6 +365,15 @@ impl Agg {
         self.batches += o.batches;
         self.pending_dropped += o.pending_dropped;
     }
+
+    fn dropped_usd_pm(&self) -> i128 {
+        let tot = self.tk_n + self.tk_dropped_usd;
+        if tot > 0 {
+            self.tk_dropped_usd * 1000 / tot
+        } else {
+            0
+        }
+    }
 }
 
 fn total(blocks: &[Agg]) -> Agg {
@@ -369,7 +438,9 @@ fn gen_mm_events(mids: &[Mid], cfg: &Cfg) -> Vec<Ev> {
         if rel_sub(m.mid, intended_ref).abs() >= cfg.requote_thr_sub {
             let decision_ms = seen_ms + cfg.mm_react_ms;
             let new_ref = mid_at(mids, decision_ms - cfg.feed_ms);
-            let jitter = rng.range_i64(0, 500_000);
+            // Full sub-millisecond jitter [0..999_999 ns] allows natural Cancel/New splits
+            // across discrete batch boundaries with physical probability (50 us / window_ms).
+            let jitter = rng.range_i64(0, 999_999);
             let arr = (decision_ms + cfg.net_ms) * NS_PER_MS + jitter;
             out.push(Ev {
                 arr_ns: arr,
@@ -397,7 +468,7 @@ fn gen_taker_events(takers: &[Taker], cfg: &Cfg) -> Vec<Ev> {
     let mut rng = SplitMix64::new(cfg.seed ^ 0x544B);
     let mut v: Vec<Ev> = Vec::with_capacity(takers.len());
     for t in takers {
-        let jitter = rng.range_i64(0, 900_000);
+        let jitter = rng.range_i64(0, 999_999);
         v.push(Ev {
             arr_ns: (t.ts_ms + cfg.net_ms) * NS_PER_MS + jitter,
             decision_ms: t.ts_ms,
@@ -452,6 +523,11 @@ impl<'a> Sim<'a> {
     fn bump_hit(&mut self, ms: i64) {
         let b = self.block_of(ms);
         self.agg[b].sniper_hit += 1;
+    }
+
+    fn bump_late_fresh(&mut self, ms: i64) {
+        let b = self.block_of(ms);
+        self.agg[b].sniper_late_fresh += 1;
     }
 
     fn bump_batch(&mut self, ms: i64) {
@@ -584,13 +660,13 @@ impl<'a> Sim<'a> {
     fn apply_cancel(&mut self, target: u64) {
         if self.proc.id == target {
             self.proc.live = false;
-        } else {
+        } else if self.cfg.batch_order == BatchOrder::CancelFirst {
             self.tomb.insert(target);
         }
     }
 
     fn apply_new(&mut self, id: u64, reff: i64) -> bool {
-        if self.tomb.remove(&id) {
+        if self.cfg.batch_order == BatchOrder::CancelFirst && self.tomb.remove(&id) {
             return false;
         }
         self.proc = Quote {
@@ -647,16 +723,32 @@ impl<'a> Sim<'a> {
     fn process_batch(&mut self, buf: &mut Vec<Ev>, clear_ns: i64) {
         let clear_ms = clear_ns / NS_PER_MS;
         let exposed = buf.iter().any(|e| matches!(e.kind, Kind::Cancel { .. }));
-        buf.sort_by_key(|e| {
-            (
-                if matches!(e.kind, Kind::Cancel { .. }) {
-                    0u8
-                } else {
-                    1u8
-                },
-                e.arr_ns,
-            )
-        });
+        match self.cfg.batch_order {
+            BatchOrder::CancelFirst => {
+                buf.sort_by_key(|e| {
+                    (
+                        if matches!(e.kind, Kind::Cancel { .. }) {
+                            0u8
+                        } else {
+                            1u8
+                        },
+                        e.arr_ns,
+                    )
+                });
+            }
+            BatchOrder::Hl => {
+                // Post-only first order:
+                // Class 0: New (ALO / post-only), Class 1: Cancel, Class 2: Taker / Sniper.
+                buf.sort_by_key(|e| {
+                    let cls = match e.kind {
+                        Kind::New { .. } => 0u8,
+                        Kind::Cancel { .. } => 1u8,
+                        Kind::Taker { .. } | Kind::Sniper { .. } => 2u8,
+                    };
+                    (cls, e.arr_ns)
+                });
+            }
+        }
         for ev in buf.iter() {
             self.handle_event(ev, clear_ms, exposed);
         }
@@ -665,17 +757,19 @@ impl<'a> Sim<'a> {
 
     fn process_fba(&mut self, buf: &mut Vec<Ev>, clear_ns: i64) {
         let clear_ms = clear_ns / NS_PER_MS;
+        // Apply New before Cancel inside FBA quote updates to avoid dead gaps on same-batch requotes.
         for ev in buf.iter() {
-            match ev.kind {
-                Kind::Cancel { target } => self.apply_cancel(target),
-                Kind::New { id, reff } => {
-                    self.apply_new(id, reff);
-                }
-                _ => {}
+            if let Kind::New { id, reff } = ev.kind {
+                self.apply_new(id, reff);
+            }
+        }
+        for ev in buf.iter() {
+            if let Kind::Cancel { target } = ev.kind {
+                self.apply_cancel(target);
             }
         }
         let mut orders: Vec<TakerOrd> = std::mem::take(&mut self.pending);
-        let mut snipers: Vec<(i8, i64)> = Vec::new();
+        let mut snipers: Vec<(i8, i64, u64)> = Vec::new();
         for ev in buf.iter() {
             match ev.kind {
                 Kind::Taker {
@@ -687,7 +781,12 @@ impl<'a> Sim<'a> {
                     notional,
                     send_ms,
                 }),
-                Kind::Sniper { dir, notional, .. } => snipers.push((dir, notional)),
+                Kind::Sniper {
+                    dir,
+                    notional,
+                    target_id,
+                    ..
+                } => snipers.push((dir, notional, target_id)),
                 _ => {}
             }
         }
@@ -728,7 +827,7 @@ impl<'a> Sim<'a> {
                 sells += n;
             }
         }
-        for &(d, n) in snipers.iter() {
+        for &(d, n, _tid) in snipers.iter() {
             let n = n.max(1) as i128;
             if d > 0 {
                 buys += n;
@@ -764,8 +863,14 @@ impl<'a> Sim<'a> {
                 }
             }
         }
-        for _ in 0..snipers.len() {
-            self.bump_hit(clear_ms);
+        // Accurate FBA sniper attribution: count as stale hit ONLY if quote ID was not refreshed.
+        let current_id = self.proc.id;
+        for &(_, _, tid) in snipers.iter() {
+            if current_id == tid {
+                self.bump_hit(clear_ms);
+            } else {
+                self.bump_late_fresh(clear_ms);
+            }
         }
     }
 }
@@ -952,6 +1057,7 @@ struct Econ {
     rebate_sub: i128,
     opex_sub: i128,
     horizon: usize,
+    wait_cohort: WaitCohort,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1003,10 +1109,15 @@ fn evaluate(a: &Agg, regime: Regime, e: &Econ) -> Option<Outcome> {
     let s_gross = classify(gross_v);
     let s_net = classify(net_v);
     let stale_q = a.tk_stale_w * Q / a.tk_n;
-    let wait_q = if a.tk_inf_n > 0 {
-        a.tk_inf_wait_w * Q / a.tk_inf_n
-    } else {
-        0
+    let wait_q = match e.wait_cohort {
+        WaitCohort::All => a.tk_wait_all_w * Q / a.tk_n,
+        WaitCohort::Large => {
+            if a.tk_inf_n > 0 {
+                a.tk_inf_wait_w * Q / a.tk_inf_n
+            } else {
+                0
+            }
+        }
     };
     let spread_paid = |sv: SStar| -> Option<i128> {
         let s = match sv {
@@ -1112,6 +1223,10 @@ fn fmt_permille(v: i128) -> String {
     let sign = if v < 0 { "-" } else { "" };
     let a = v.abs();
     format!("{}{}.{}%", sign, a / 10, a % 10)
+}
+
+fn fmt_dropped_cell(a: &Agg) -> String {
+    format!("{} ({})", a.tk_dropped, fmt_permille(a.dropped_usd_pm()))
 }
 
 fn fmt_s(s: SStar) -> String {
@@ -1385,21 +1500,47 @@ fn load_agg_trades_csv(path: &Path) -> Result<Vec<Taker>, String> {
     Ok(out)
 }
 
-/// Reconstructs takers and L1 mid-price from raw `trades` CSV:
-///   * `MidMode::BidAskProxy`: tracks `last_ask` (buyer aggressor, `ibm == false`) and `last_bid`
-///     (seller aggressor, `ibm == true`), setting `mid = (last_bid + last_ask) / 2` once both exist.
-///   * `MidMode::TradeHalfTick`: sets `mid = price +/- half_tick` on every execution.
+/// Core pure function for reconstructing a bid/ask midpoint proxy from `(price, is_buyer_maker)`
+/// observations. Exposed for unit testing (`t_bidask_mid_proxy`).
+fn reconstruct_bidask_step(
+    last_bid: &mut Option<i64>,
+    last_ask: &mut Option<i64>,
+    price: i64,
+    ibm: bool,
+    diag: &mut ProxyDiag,
+) -> Option<i64> {
+    if ibm {
+        *last_bid = Some(price);
+    } else {
+        *last_ask = Some(price);
+    }
+    if let (Some(b), Some(a)) = (*last_bid, *last_ask) {
+        diag.total_obs += 1;
+        if a >= b {
+            diag.valid_spread_obs += 1;
+            diag.spread_sum_sub += rel_sub(a, b) as i128;
+            Some((b + a) / 2)
+        } else {
+            diag.crossed_obs += 1;
+            Some(price)
+        }
+    } else {
+        None
+    }
+}
+
 fn load_trades_csv(
     path: &Path,
     half_tick: i64,
     mode: MidMode,
-) -> Result<(Vec<Taker>, Vec<Mid>), String> {
+) -> Result<(Vec<Taker>, Vec<Mid>, ProxyDiag), String> {
     let file = File::open(path).map_err(|e| format!("open {}: {}", path.display(), e))?;
     let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
     let mut takers: Vec<Taker> = Vec::with_capacity(2_000_000);
     let mut mids: Vec<Mid> = Vec::with_capacity(2_000_000);
     let mut last_bid: Option<i64> = None;
     let mut last_ask: Option<i64> = None;
+    let mut diag = ProxyDiag::default();
 
     for line_res in reader.lines() {
         let line = line_res.map_err(|e| e.to_string())?;
@@ -1436,13 +1577,9 @@ fn load_trades_csv(
                 push_mid(&mut mids, ts, mid);
             }
             MidMode::BidAskProxy => {
-                if ibm {
-                    last_bid = Some(price);
-                } else {
-                    last_ask = Some(price);
-                }
-                if let (Some(b), Some(a)) = (last_bid, last_ask) {
-                    let mid = if a >= b { (b + a) / 2 } else { price };
+                if let Some(mid) =
+                    reconstruct_bidask_step(&mut last_bid, &mut last_ask, price, ibm, &mut diag)
+                {
                     push_mid(&mut mids, ts, mid);
                 }
             }
@@ -1451,7 +1588,7 @@ fn load_trades_csv(
     }
     takers.sort_by_key(|t| t.ts_ms);
     mids.sort_by_key(|m| m.ts_ms);
-    Ok((takers, mids))
+    Ok((takers, mids, diag))
 }
 
 // ============================================================================
@@ -1480,7 +1617,13 @@ struct Args {
     decrypt: Vec<i64>,
     placebo_shifts: Vec<i64>,
     pending_policy: PendingPolicy,
+    b_batch_order: BatchOrder,
+    d_batch_order: BatchOrder,
+    wait_cohort: WaitCohort,
     mid_mode: MidMode,
+    rebate_sub: i128,
+    opex_sub: i128,
+    large_usd: i64,
     block_hours: i64,
     allow_reconstructed: bool,
     bootstrap: usize,
@@ -1503,6 +1646,17 @@ fn parse_list_i64(s: &str) -> Vec<i64> {
     s.split(',').filter_map(|x| x.trim().parse().ok()).collect()
 }
 
+fn parse_batch_order(val: &str, flag: &str) -> BatchOrder {
+    match val.trim().to_ascii_lowercase().as_str() {
+        "hl" => BatchOrder::Hl,
+        "cancel-first" => BatchOrder::CancelFirst,
+        _ => {
+            eprintln!("{} must be 'hl' or 'cancel-first'", flag);
+            std::process::exit(2);
+        }
+    }
+}
+
 fn parse_args() -> Args {
     let mut a = Args {
         data_dir: "./data".to_string(),
@@ -1517,7 +1671,13 @@ fn parse_args() -> Args {
         decrypt: vec![0, 35, 70],
         placebo_shifts: vec![600_000, 3_600_000],
         pending_policy: PendingPolicy::Hold,
+        b_batch_order: BatchOrder::Hl,
+        d_batch_order: BatchOrder::Hl,
+        wait_cohort: WaitCohort::All,
         mid_mode: MidMode::BidAskProxy,
+        rebate_sub: 50,
+        opex_sub: 30,
+        large_usd: 50_000,
         block_hours: 3,
         allow_reconstructed: false,
         bootstrap: 1000,
@@ -1558,6 +1718,20 @@ fn parse_args() -> Args {
                             std::process::exit(2);
                         }
                     },
+                    "--b-batch-order" | "--batch-order" => {
+                        a.b_batch_order = parse_batch_order(&val, "--b-batch-order");
+                    }
+                    "--d-batch-order" => {
+                        a.d_batch_order = parse_batch_order(&val, "--d-batch-order");
+                    }
+                    "--wait-cohort" => match val.trim().to_ascii_lowercase().as_str() {
+                        "all" => a.wait_cohort = WaitCohort::All,
+                        "large" => a.wait_cohort = WaitCohort::Large,
+                        _ => {
+                            eprintln!("--wait-cohort must be 'all' or 'large'");
+                            std::process::exit(2);
+                        }
+                    },
                     "--mid-mode" => match val.trim().to_ascii_lowercase().as_str() {
                         "bidask" => a.mid_mode = MidMode::BidAskProxy,
                         "trade" => a.mid_mode = MidMode::TradeHalfTick,
@@ -1566,6 +1740,9 @@ fn parse_args() -> Args {
                             std::process::exit(2);
                         }
                     },
+                    "--rebate-sub" => a.rebate_sub = val.parse().unwrap_or(50),
+                    "--opex-sub" => a.opex_sub = val.parse().unwrap_or(30),
+                    "--large-usd" => a.large_usd = val.parse().unwrap_or(50_000),
                     "--block-hours" => a.block_hours = val.parse().unwrap_or(3),
                     "--bootstrap" => a.bootstrap = val.parse().unwrap_or(1000),
                     "--threads" => a.threads = val.parse().unwrap_or(4),
@@ -1580,6 +1757,7 @@ fn parse_args() -> Args {
     }
     a.block_hours = a.block_hours.max(1);
     a.threads = a.threads.max(1);
+    a.large_usd = a.large_usd.max(1);
     if a.mm_react.is_empty() {
         a.mm_react = vec![10];
     }
@@ -1599,6 +1777,7 @@ fn push_core_specs(v: &mut Vec<Spec>, args: &Args, r: i64, shift: i64) {
     let mut base = default_cfg();
     base.mm_react_ms = r;
     base.pending_policy = args.pending_policy;
+    base.large_usd = args.large_usd;
     let bw = args.b_window();
 
     let mut a = base;
@@ -1611,18 +1790,28 @@ fn push_core_specs(v: &mut Vec<Spec>, args: &Args, r: i64, shift: i64) {
         cfg: a,
         label: format!("A: Continuous FIFO | react {}ms{}", r, suffix),
     });
+
     let mut b = base;
     b.window_ms = bw;
+    b.batch_order = args.b_batch_order;
     v.push(Spec {
         regime: Regime::CancelPrio,
         react: r,
         decrypt: 0,
         shift,
         cfg: b,
-        label: format!("B: Cancel-Priority {}ms | react {}ms{}", bw, r, suffix),
+        label: format!(
+            "B: Batch {}ms ({}) | react {}ms{}",
+            bw,
+            args.b_batch_order.as_str(),
+            r,
+            suffix
+        ),
     });
+
     let mut c = base;
     c.window_ms = args.fba_window_ms;
+    c.batch_order = BatchOrder::Hl;
     v.push(Spec {
         regime: Regime::UniformFba,
         react: r,
@@ -1634,10 +1823,12 @@ fn push_core_specs(v: &mut Vec<Spec>, args: &Args, r: i64, shift: i64) {
             args.fba_window_ms, r, suffix
         ),
     });
+
     for &d in &args.decrypt {
         let mut dd = base;
         dd.window_ms = args.window_ms;
         dd.decrypt_ms = d;
+        dd.batch_order = args.d_batch_order;
         v.push(Spec {
             regime: Regime::IbteCancelPrio,
             react: r,
@@ -1645,8 +1836,12 @@ fn push_core_specs(v: &mut Vec<Spec>, args: &Args, r: i64, shift: i64) {
             shift,
             cfg: dd,
             label: format!(
-                "D: Dywe IBTE + Cancel-Prio {}ms (dec {}ms) | react {}ms{}",
-                args.window_ms, d, r, suffix
+                "D: Dywe IBTE {}ms (dec {}ms, {}) | react {}ms{}",
+                args.window_ms,
+                d,
+                args.d_batch_order.as_str(),
+                r,
+                suffix
             ),
         });
     }
@@ -1676,6 +1871,7 @@ struct DayResult {
     reconstructed: bool,
     mid_ticks: usize,
     taker_orders: usize,
+    proxy_diag: ProxyDiag,
 }
 
 fn run_day(
@@ -1696,6 +1892,7 @@ fn run_day(
         reconstructed: false,
         mid_ticks: 0,
         taker_orders: 0,
+        proxy_diag: ProxyDiag::default(),
     };
     let bt_s = format!("{}/{}-bookTicker-{}.csv", args.data_dir, sym, date);
     let tr_s = format!("{}/{}-trades-{}.csv", args.data_dir, sym, date);
@@ -1706,6 +1903,7 @@ fn run_day(
 
     let mut trade_takers: Option<Vec<Taker>> = None;
     let mut reconstructed = false;
+    let mut proxy_diag = ProxyDiag::default();
     let mids: Vec<Mid> = if bt.exists() {
         match load_book_ticker(bt) {
             Ok(m) => m,
@@ -1713,9 +1911,10 @@ fn run_day(
         }
     } else if args.allow_reconstructed && tr.exists() {
         match load_trades_csv(tr, half_tick_1e8(&sym), args.mid_mode) {
-            Ok((t, m)) => {
+            Ok((t, m, diag)) => {
                 trade_takers = Some(t);
                 reconstructed = true;
+                proxy_diag = diag;
                 m
             }
             Err(e) => return skip(format!("{} {}: {}", sym, date, e)),
@@ -1735,7 +1934,7 @@ fn run_day(
         t
     } else if tr.exists() {
         match load_trades_csv(tr, 0, args.mid_mode) {
-            Ok((t, _)) => t,
+            Ok((t, _, _)) => t,
             Err(e) => return skip(format!("{} {}: {}", sym, date, e)),
         }
     } else {
@@ -1802,6 +2001,7 @@ fn run_day(
         reconstructed,
         mid_ticks: mids.len(),
         taker_orders: takers.len(),
+        proxy_diag,
     }
 }
 
@@ -1811,33 +2011,33 @@ fn run_day(
 
 const CALIBRATION_NOTES: [(&str, &str, &str); 6] = [
     (
-        "Hyperliquid: end-to-end latency",
-        "The docs define end-to-end latency as the time from sending a request to receiving the committed response. A third-party mirror that cites the official docs reports a median of about 0.2 s and a 99th percentile of about 0.9 s for a co-located client (an older analyst note quotes a 0.3 s median). The numeric values were not visible in the official page excerpt retrieved here.",
-        "https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/overview ; https://www.dwellir.com/docs/hyperliquid/architecture",
+        "Hyperliquid: intra-batch priority order",
+        "Official docs (hyperliquid-l1/order-book) state that within each consensus batch, non-GTC/IOC actions (i.e. post-only / ALO) are processed first, followed by cancels, followed by GTC/IOC orders. Thus new MM post-only quotes land before cancels and takers without a dead gap. Model this with `--b-batch-order hl`.",
+        "https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-l1/order-book",
     ),
     (
-        "Hyperliquid: block interval",
-        "Not stated in the official page retrieved. A third-party node-docs site says blocks come about every 70 ms with finality in about two rounds (around 140 ms); an analyst post describes block commits in the range of 200-300 ms and an observed lag of about 700 ms in fills versus Binance (maker update in one block, taker fill in the next). Treat the block interval as roughly 70-300 ms and UNVERIFIED.",
-        "https://hypernode-docs.polynode.dev/research/consensus ; https://arrakis.finance/blog/crypto-price-discovery",
+        "Hyperliquid: block interval & buckets",
+        "Official docs (for-developers/api/priority-fees) state that IOC orders are sorted in 70 ms unix-time buckets, typically corresponding to one block (with 1-2 consensus batches per block, meaning effective batch windows may be shorter than 70 ms). End-to-end co-located latency is cited around ~0.2 s median in third-party mirrors.",
+        "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/priority-fees ; https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/overview",
     ),
     (
         "dYdX Chain (v4): block time",
-        "The official onboarding FAQ states an average block time of about 1 second, and that short-term order cancels are best effort until the block is final. Some third-party pages claim 0.5 s or even 100 ms blocks; they conflict with the official FAQ and are not used here.",
+        "The official onboarding FAQ states an average block time of about 1 second, and that short-term order cancels are best effort until the block is final. Use `--b-window-ms 1000` to evaluate a 1-second batching cadence.",
         "https://docs.dydx.xyz/concepts/onboarding-faqs",
     ),
     (
         "Not documented (stay assumptions)",
-        "No venue documentation was found for market-maker reaction time, market-data feed latency, client-to-sequencer network latency or latency-arbitrageur reaction time. The model defaults (feed 5 ms, MM reaction 10 ms, sniper reaction 2 ms, network 30 ms) are assumptions. Sweep them (--mm-react) instead of trusting a single value.",
+        "No venue documentation specifies MM reaction time, market-data feed latency, client-to-sequencer network transit, or latency-arbitrageur reaction time. Defaults (feed 5 ms, MM reaction 10 ms, sniper reaction 2 ms, network 30 ms) are parameterized assumptions; sweep `--mm-react` rather than trusting a single point.",
         "n/a",
     ),
     (
-        "Dywe window",
-        "The 50 ms micro-batch and the 35 ms decryption RTT are Dywe design/benchmark parameters, not venue documentation. They are not validated by any source above.",
+        "Dywe window & post-decrypt matching",
+        "The 50 ms micro-batch and 35 ms / 70 ms decryption RTTs are Dywe design parameters, not live multi-region Devnet measurements. Because threshold decryption completes in matching-engine memory BEFORE the first fill at `clear_ns`, Dywe can execute `hl` post-only-first ordering (`--d-batch-order hl`) without leaking ALO/IOC flags pre-commit. Use `--d-batch-order cancel-first` to stress-test strict pre-decrypt cancel-only sorting.",
         "n/a",
     ),
     (
-        "Implication for Regime B",
-        "If B is meant to represent Hyperliquid, a 50 ms window is shorter than every documented latency figure above. Use --b-window-ms 70 and --b-window-ms 200 (separate runs) to read the cancel-priority gap at those scales, and --b-window-ms 1000 for a dYdX-like cadence.",
+        "Stylized model disclaimer",
+        "Regimes B (70 ms / 200 ms / 1000 ms) are stylized batching models, not byte-for-byte reproductions of Hyperliquid or dYdX matching engines.",
         "n/a",
     ),
 ];
@@ -1959,12 +2159,13 @@ mod selfcheck {
         let (mids, takers) = synth(11, 200_000);
         let mut cb = default_cfg();
         cb.log = false;
+        cb.batch_order = BatchOrder::CancelFirst;
         let mut cd = cb;
         cd.decrypt_ms = 0;
         let ob = run(&mids, &takers, Regime::CancelPrio, &cb);
         let od = run(&mids, &takers, Regime::IbteCancelPrio, &cd);
         if ob.agg != od.agg {
-            return Err("identity: D(decrypt=0) != B at Agg accumulator level".to_string());
+            return Err("identity: D(decrypt=0) != B(cancel-first) at Agg accumulator level".to_string());
         }
         let e = Econ {
             capture_ppm: 0,
@@ -1974,6 +2175,7 @@ mod selfcheck {
             rebate_sub: 50,
             opex_sub: 30,
             horizon: 2,
+            wait_cohort: WaitCohort::All,
         };
         let tb = total(&ob.agg);
         let td = total(&od.agg);
@@ -2078,6 +2280,7 @@ mod selfcheck {
                 rebate_sub: 0,
                 opex_sub: 0,
                 horizon: 2,
+                wait_cohort: WaitCohort::All,
             };
             let o = evaluate(&a, Regime::CancelPrio, &e).ok_or("evaluate returned None")?;
             let got = o.mev_mm_q * n + o.mev_tk_q * n;
@@ -2124,6 +2327,7 @@ mod selfcheck {
             rebate_sub: 50,
             opex_sub: 30,
             horizon: 2,
+            wait_cohort: WaitCohort::All,
         };
         for &r in regimes.iter() {
             let cfg = cfg_for(r);
@@ -2212,12 +2416,11 @@ mod selfcheck {
         ))
     }
 
-    /// Verifies that `--pending-policy drop` drops takers arriving during a cancel-replace gap
-    /// instead of holding them until the next quote.
     pub fn pending_drop_policy() -> Result<String, String> {
         let (mids, takers) = synth(61, 150_000);
         let mut cfg_hold = default_cfg();
         cfg_hold.window_ms = 200;
+        cfg_hold.batch_order = BatchOrder::CancelFirst;
         cfg_hold.pending_policy = PendingPolicy::Hold;
 
         let mut cfg_drop = cfg_hold;
@@ -2241,8 +2444,165 @@ mod selfcheck {
         ))
     }
 
+    pub fn hl_batch_order() -> Result<String, String> {
+        let (mids, takers) = synth(73, 150_000);
+        let mut cfg_hl = default_cfg();
+        cfg_hl.window_ms = 200;
+        cfg_hl.batch_order = BatchOrder::Hl;
+        cfg_hl.pending_policy = PendingPolicy::Drop;
+
+        let mut cfg_cf = cfg_hl;
+        cfg_cf.batch_order = BatchOrder::CancelFirst;
+
+        let a_hl = total(&run(&mids, &takers, Regime::CancelPrio, &cfg_hl).agg);
+        let a_cf = total(&run(&mids, &takers, Regime::CancelPrio, &cfg_cf).agg);
+
+        if a_cf.tk_dropped == 0 {
+            return Err("hl_batch_order: expected cancel-first+drop to drop gap takers".to_string());
+        }
+        if a_hl.tk_dropped * 20 >= a_cf.tk_dropped {
+            return Err(format!(
+                "hl_batch_order: HL order dropped {} vs cancel-first {}",
+                a_hl.tk_dropped, a_cf.tk_dropped
+            ));
+        }
+        Ok(format!(
+            "HL order (New->Cancel->Taker) dropped {} vs cancel-first {} under drop policy",
+            a_hl.tk_dropped, a_cf.tk_dropped
+        ))
+    }
+
+    /// Verifies that Regime D with post-decrypt `hl` ordering and `decrypt_ms=0` matches
+    /// Regime B (`hl`) bit-for-bit and eliminates artificial same-batch cancel-gap drops.
+    pub fn d_post_decrypt_hl_order() -> Result<String, String> {
+        let (mids, takers) = synth(79, 150_000);
+        let mut cfg_b = default_cfg();
+        cfg_b.window_ms = 50;
+        cfg_b.batch_order = BatchOrder::Hl;
+        cfg_b.pending_policy = PendingPolicy::Drop;
+
+        let mut cfg_d_hl = cfg_b;
+        cfg_d_hl.decrypt_ms = 0;
+
+        let mut cfg_d_cf = cfg_d_hl;
+        cfg_d_cf.batch_order = BatchOrder::CancelFirst;
+
+        let ab = run(&mids, &takers, Regime::CancelPrio, &cfg_b);
+        let ad_hl = run(&mids, &takers, Regime::IbteCancelPrio, &cfg_d_hl);
+        let ad_cf = run(&mids, &takers, Regime::IbteCancelPrio, &cfg_d_cf);
+
+        if ab.agg != ad_hl.agg {
+            return Err("d_post_decrypt_hl: D(hl, dec=0) != B(hl) at Agg level".to_string());
+        }
+        let t_hl = total(&ad_hl.agg);
+        let t_cf = total(&ad_cf.agg);
+        if t_hl.tk_dropped * 10 >= t_cf.tk_dropped.max(1) {
+            return Err(format!(
+                "d_post_decrypt_hl: expected D(hl) drops ({}) << D(cancel-first) drops ({})",
+                t_hl.tk_dropped, t_cf.tk_dropped
+            ));
+        }
+        Ok(format!(
+            "D(hl, dec=0)==B(hl) bit-for-bit; dropped takers reduced from {} (cancel-first) to {} (hl)",
+            t_cf.tk_dropped, t_hl.tk_dropped
+        ))
+    }
+
+    /// Verifies that in Regime C (Uniform-Price FBA), a sniper arriving in the same batch as
+    /// MM's requote is counted as `sniper_late_fresh` rather than a stale `sniper_hit`.
+    pub fn fba_sniper_attribution() -> Result<String, String> {
+        let base_p = 100 * PRICE_SCALE;
+        let jump_p = 100 * PRICE_SCALE + 30_000_000; // +30 bps (> sniper_thr 200 sub & requote 150 sub)
+        let mids = vec![
+            Mid { ts_ms: 0, mid: base_p },
+            Mid { ts_ms: 10, mid: jump_p },
+            Mid { ts_ms: 2000, mid: jump_p },
+        ];
+        let takers = vec![Taker {
+            ts_ms: 15,
+            dir: 1,
+            notional_usd: 10_000,
+        }];
+        let mut cfg = default_cfg();
+        cfg.window_ms = 100;
+        cfg.batch_order = BatchOrder::Hl;
+        let out = simulate(&mids, &takers, Regime::UniformFba, &cfg, 0, 60_000, 1);
+        let a = total(&out.agg);
+        if a.sniper_hit != 0 || a.sniper_late_fresh != 1 {
+            return Err(format!(
+                "fba_sniper_attribution: expected sniper_hit=0, late_fresh=1; got hit={}, late_fresh={}",
+                a.sniper_hit, a.sniper_late_fresh
+            ));
+        }
+        Ok("FBA sniper arriving after same-batch MM requote attributed to late_fresh (0 stale hits)".to_string())
+    }
+
+    /// Verifies exact single-denominator linearity under `WaitCohort::All` vs `WaitCohort::Large`.
+    pub fn wait_cohort_all_identity() -> Result<String, String> {
+        let a = Agg {
+            mm_n: 1_000_000,
+            mm_w: [-10_000_000, -15_000_000, -20_000_000],
+            tk_n: 1_000_000,
+            tk_scoef_w: 1_000_000,
+            tk_stale_w: -20_000_000,
+            tk_wait_all_w: 50_000_000,  // 0.500 bps across all takers
+            tk_inf_n: 200_000,
+            tk_inf_wait_w: 30_000_000,  // 1.500 bps across large takers
+            ..Agg::default()
+        };
+        let e_all = Econ {
+            capture_ppm: 0,
+            impact_sub: 0,
+            mm_share_ppm: 500_000,
+            leak_ppm: 0,
+            rebate_sub: 50,
+            opex_sub: 30,
+            horizon: 2,
+            wait_cohort: WaitCohort::All,
+        };
+        let mut e_large = e_all;
+        e_large.wait_cohort = WaitCohort::Large;
+
+        let o_all = evaluate(&a, Regime::Fifo, &e_all).ok_or("o_all None")?;
+        let o_large = evaluate(&a, Regime::Fifo, &e_large).ok_or("o_large None")?;
+
+        if o_all.wait_q != 50_000 || o_large.wait_q != 150_000 {
+            return Err(format!(
+                "wait_cohort: expected all=50000q, large=150000q; got all={}, large={}",
+                o_all.wait_q, o_large.wait_q
+            ));
+        }
+        let sp = o_all.spread_paid_q.ok_or("sp None")?;
+        let all_in = o_all.all_in_net.ok_or("all_in None")?;
+        if all_in != sp + o_all.stale_q + o_all.wait_q + o_all.mev_tk_q {
+            return Err("wait_cohort: exact additive identity failed under WaitCohort::All".to_string());
+        }
+        Ok("WaitCohort::All (single denominator tk_n) and WaitCohort::Large verified".to_string())
+    }
+
+    pub fn bidask_mid_proxy() -> Result<String, String> {
+        let mut lb = None;
+        let mut la = None;
+        let mut diag = ProxyDiag::default();
+        if reconstruct_bidask_step(&mut lb, &mut la, 100 * PRICE_SCALE, true, &mut diag).is_some() {
+            return Err("bidask_proxy: emitted mid with only one side".to_string());
+        }
+        let m1 = reconstruct_bidask_step(&mut lb, &mut la, 102 * PRICE_SCALE, false, &mut diag);
+        if m1 != Some(101 * PRICE_SCALE) {
+            return Err(format!("bidask_proxy: expected 101, got {:?}", m1));
+        }
+        let m2 = reconstruct_bidask_step(&mut lb, &mut la, 104 * PRICE_SCALE, true, &mut diag);
+        if m2 != Some(104 * PRICE_SCALE) || diag.crossed_obs != 1 || diag.valid_spread_obs != 1 {
+            return Err(format!(
+                "bidask_proxy: crossed fallback failed (m2={:?}, diag={:?})",
+                m2, diag
+            ));
+        }
+        Ok("normal midpoint and crossed-side fallback + diagnostics verified".to_string())
+    }
+
     pub fn run_all() -> bool {
-        let checks: [(&str, fn() -> Result<String, String>); 8] = [
+        let checks: [(&str, fn() -> Result<String, String>); 13] = [
             ("causality (no look-ahead)", causality),
             ("identity D==B (decrypt=0, mev=0, leak=0)", identity),
             ("shuffled-side zero-spread + sign control", shuffled_zero_spread),
@@ -2251,6 +2611,11 @@ mod selfcheck {
             ("accounting reconciliation (volumes & All-In)", accounting_reconciliation),
             ("placebo breaks the flow-price link", placebo_breaks_link),
             ("pending-policy drop vs hold semantics", pending_drop_policy),
+            ("Hyperliquid batch order (New->Cancel->Taker)", hl_batch_order),
+            ("Regime D post-decrypt HL batch order", d_post_decrypt_hl_order),
+            ("FBA sniper stale vs late_fresh attribution", fba_sniper_attribution),
+            ("WaitCohort::All single-denominator identity", wait_cohort_all_identity),
+            ("BidAskProxy midpoint & crossed diagnostics", bidask_mid_proxy),
         ];
         let mut ok = true;
         for (name, f) in checks.iter() {
@@ -2303,6 +2668,26 @@ mod tests {
         selfcheck::pending_drop_policy().unwrap();
     }
     #[test]
+    fn t_hl_batch_order() {
+        selfcheck::hl_batch_order().unwrap();
+    }
+    #[test]
+    fn t_d_post_decrypt_hl_order() {
+        selfcheck::d_post_decrypt_hl_order().unwrap();
+    }
+    #[test]
+    fn t_fba_sniper_attribution() {
+        selfcheck::fba_sniper_attribution().unwrap();
+    }
+    #[test]
+    fn t_wait_cohort_all_identity() {
+        selfcheck::wait_cohort_all_identity().unwrap();
+    }
+    #[test]
+    fn t_bidask_mid_proxy() {
+        selfcheck::bidask_mid_proxy().unwrap();
+    }
+    #[test]
     fn t_html_escape() {
         assert_eq!(super::html_escape("D<B & B<D"), "D&lt;B &amp; B&lt;D");
     }
@@ -2312,15 +2697,16 @@ mod tests {
 // Markdown & HTML Report Generation
 // ============================================================================
 
-fn base_econ() -> Econ {
+fn base_econ(args: &Args) -> Econ {
     Econ {
         capture_ppm: 0,
         impact_sub: 0,
         mm_share_ppm: 500_000,
         leak_ppm: 0,
-        rebate_sub: 50,
-        opex_sub: 30,
+        rebate_sub: args.rebate_sub,
+        opex_sub: args.opex_sub,
         horizon: 2,
+        wait_cohort: args.wait_cohort,
     }
 }
 
@@ -2332,12 +2718,17 @@ fn markout1s(a: &Agg) -> Option<i128> {
     }
 }
 
-fn table(rep: &mut String, title: &str, specs: &[Spec], totals: &[Agg], shift: i64) {
-    let e0 = base_econ();
+fn table(rep: &mut String, title: &str, specs: &[Spec], totals: &[Agg], shift: i64, args: &Args) {
+    let e0 = base_econ(args);
+    let wait_col = match args.wait_cohort {
+        WaitCohort::All => "[3] Wait (All)",
+        WaitCohort::Large => "[3] Wait (Large)",
+    };
     emit!(rep, "\n### {}", title);
     emit!(
         rep,
-        "| Regime | MM Total Vol | Markout 0ms | 100ms | 1s | s* gross | s* net | [1] Spread Paid | [2] Taker Stale | [3] Informed Wait | [=] All-In Net ([1]+[2]+[3]) | StaleSnipe Hit/Miss | Dropped Takers | Batches |"
+        "| Regime | MM Total Vol | Markout 0ms | 100ms | 1s | s* gross | s* net | [1] Spread Paid | [2] Taker Stale | {} | [=] All-In Net ([1]+[2]+[3]) | StaleSnipe Hit/Miss | Dropped Takers (USD%) | Batches |",
+        wait_col
     );
     emit!(
         rep,
@@ -2371,25 +2762,33 @@ fn table(rep: &mut String, title: &str, specs: &[Spec], totals: &[Agg], shift: i
                     fmt_opt(o.all_in_net),
                     a.sniper_hit,
                     a.sniper_missed,
-                    a.tk_dropped,
+                    fmt_dropped_cell(a),
                     a.batches
                 );
             }
         }
     }
+    let drop_note = if args.pending_policy == PendingPolicy::Drop {
+        " Note: under `pending=drop`, dropped takers are excluded from both MM markout and All-In Net (check `Dropped Takers (USD%)` for selection bias)."
+    } else {
+        ""
+    };
     emit!(
         rep,
-        "\nUnits: bps. Exact identity at MEV=0: `[1] Spread Paid + [2] Taker Stale + [3] Informed Wait = All-In Net` (within 0.001 bps display rounding)."
+        "\nUnits: bps. Exact identity at MEV=0: `[1] Spread Paid + [2] Taker Stale + [3] Wait = All-In Net` (within 0.001 bps display rounding; wait_cohort=`{}`).{}",
+        args.wait_cohort.as_str(),
+        drop_note
     );
 }
 
-fn cohort_table(rep: &mut String, title: &str, specs: &[Spec], totals: &[Agg]) {
+fn cohort_table(rep: &mut String, title: &str, specs: &[Spec], totals: &[Agg], args: &Args) {
     emit!(rep, "\n### {} — MM Flow Cohort Decomposition & Volume Reconciliation", title);
     emit!(
         rep,
-        "| Regime | Taker Vol | StaleSnipe Vol | LateSnipe Vol | Total MM Vol | Vol Diff | Taker 1s Markout | StaleSnipe 1s Markout | LateSnipe 1s Markout |"
+        "| Regime | Taker Vol | StaleSnipe Vol | LateSnipe Vol | Total MM Vol | Vol Diff | Taker 1s Markout | StaleSnipe 1s Markout | LateSnipe 1s Markout | Large Vol % (>={}) | Cancel-Batch Large % |",
+        fmt_usd(args.large_usd as i128)
     );
-    emit!(rep, "|---|---:|---:|---:|---:|---:|---:|---:|---:|");
+    emit!(rep, "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
     for (sp, a) in specs.iter().zip(totals.iter()) {
         if sp.shift != 0 {
             continue;
@@ -2411,9 +2810,19 @@ fn cohort_table(rep: &mut String, title: &str, specs: &[Spec], totals: &[Agg]) {
         } else {
             "n/a".to_string()
         };
+        let large_pm = if a.tk_n > 0 {
+            a.tk_large_n * 1000 / a.tk_n
+        } else {
+            0
+        };
+        let exp_pm = if a.tk_large_n > 0 {
+            a.tk_large_exp_n * 1000 / a.tk_large_n
+        } else {
+            0
+        };
         emit!(
             rep,
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             sp.label,
             fmt_usd(a.mm_taker_n),
             fmt_usd(a.mm_sniper_stale_n),
@@ -2422,9 +2831,15 @@ fn cohort_table(rep: &mut String, title: &str, specs: &[Spec], totals: &[Agg]) {
             fmt_usd(diff_v),
             m_tk,
             m_st,
-            m_lt
+            m_lt,
+            fmt_permille(large_pm),
+            fmt_permille(exp_pm)
         );
     }
+    emit!(
+        rep,
+        "\nReconciliation note: `StaleSnipe` represents orders hitting the exact un-updated quote ID targeted at trigger time; `LateSnipe` represents sniper orders arriving after MM already requoted. In Regime C (Uniform-Price FBA), taker and sniper orders net internally into a single imbalance before clearing against the MM, so sniper volumes are absorbed into `Taker Vol` (net imbalance). `Cancel-Batch Large %` shows the share of large orders arriving inside a batch that also contains an MM cancel (the exposure base for `leak_ppm` in Regime D)."
+    );
 }
 
 fn placebo_lines(specs: &[Spec], full: &[Agg], args: &Args) -> Vec<String> {
@@ -2510,6 +2925,7 @@ struct FrontierGrid {
     decrypt_ms: i64,
     react_ms: i64,
     cells: Vec<String>,
+    selection_bias_warn: Option<String>,
 }
 
 fn frontier(
@@ -2521,7 +2937,7 @@ fn frontier(
     args: &Args,
 ) -> Vec<FrontierGrid> {
     let mut html_grids = Vec::new();
-    csv.push_str("react_ms,decrypt_ms,b_window_ms,d_window_ms,pending_policy,mid_mode,capture_ppm,impact_sub,mm_share_ppm,leak_ppm,allin_B_q,allin_D_q,delta_D_minus_B_q,ci_lo_q,ci_hi_q,verdict\n");
+    csv.push_str("react_ms,decrypt_ms,b_window_ms,d_window_ms,b_batch_order,d_batch_order,pending_policy,mid_mode,wait_cohort,rebate_sub,opex_sub,b_dropped_usd_pm,d_dropped_usd_pm,capture_ppm,impact_sub,mm_share_ppm,leak_ppm,allin_B_q,allin_D_q,delta_D_minus_B_q,ci_lo_q,ci_hi_q,verdict\n");
     for &react in &args.mm_react {
         let ib = match find_spec(specs, Regime::CancelPrio, react, 0, 0) {
             Some(i) => i,
@@ -2534,6 +2950,18 @@ fn frontier(
             };
             let bw = specs[ib].cfg.window_ms;
             let dw = specs[id].cfg.window_ms;
+            let db_pm = full[ib].dropped_usd_pm();
+            let dd_pm = full[id].dropped_usd_pm();
+            let bias_warn = if (db_pm - dd_pm).abs() >= 10 {
+                Some(format!(
+                    "Dropped taker USD share differs materially between B ({}) and D ({}). Direct All-In comparison is confounded by fill-rate selection bias; use `--pending-policy hold` or matching batch orders (`--b-batch-order hl --d-batch-order hl`) for equal-volume cost comparison.",
+                    fmt_permille(db_pm),
+                    fmt_permille(dd_pm)
+                ))
+            } else {
+                None
+            };
+
             let mut cells: Vec<String> = vec![String::new(); CAPTURES_PPM.len() * IMPACTS_SUB.len()];
             for &share in SHARES_PPM.iter() {
                 for &leak in LEAKS_PPM.iter() {
@@ -2544,9 +2972,10 @@ fn frontier(
                                 impact_sub: imp,
                                 mm_share_ppm: share,
                                 leak_ppm: leak,
-                                rebate_sub: 50,
-                                opex_sub: 30,
+                                rebate_sub: args.rebate_sub,
+                                opex_sub: args.opex_sub,
                                 horizon: 2,
+                                wait_cohort: args.wait_cohort,
                             };
                             let ab = evaluate(&full[ib], Regime::CancelPrio, &e)
                                 .and_then(|o| o.all_in_net);
@@ -2568,13 +2997,20 @@ fn frontier(
                                 None => (String::new(), String::new()),
                             };
                             csv.push_str(&format!(
-                                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                                 react,
                                 dec,
                                 bw,
                                 dw,
+                                args.b_batch_order.as_str(),
+                                args.d_batch_order.as_str(),
                                 args.pending_policy.as_str(),
                                 args.mid_mode.as_str(),
+                                args.wait_cohort.as_str(),
+                                args.rebate_sub,
+                                args.opex_sub,
+                                db_pm,
+                                dd_pm,
                                 cap,
                                 imp,
                                 share,
@@ -2599,13 +3035,24 @@ fn frontier(
             if react == args.mm_react[0] {
                 emit!(
                     rep,
-                    "\n#### Break-Even Frontier: All-In(D) − All-In(B) (bps) | B window {}ms, D window {}ms, decrypt {}ms | react {}ms | pending={} | mid={}",
+                    "\n#### Break-Even Frontier: All-In(D) − All-In(B) (bps) | B {}ms ({}), D {}ms (dec {}ms, {}) | react {}ms | pending={} | mid={} | wait={}",
                     bw,
+                    args.b_batch_order.as_str(),
                     dw,
                     dec,
+                    args.d_batch_order.as_str(),
                     react,
                     args.pending_policy.as_str(),
-                    args.mid_mode.as_str()
+                    args.mid_mode.as_str(),
+                    args.wait_cohort.as_str()
+                );
+                if let Some(ref warn_msg) = bias_warn {
+                    emit!(rep, "> **WARNING (Selection Bias):** {}", warn_msg);
+                }
+                emit!(
+                    rep,
+                    "Rows: MEV capture rate on large orders (>={}) in Regime B. Columns: per-order MEV impact (bps). Verdict: `D<B` = Dywe cheaper for takers (95% CI < 0); `B<D` = Regime B cheaper; `~` = statistically indistinguishable. **Every cell except the 0%-capture row is a parameterized scenario output, not a measurement.**",
+                    fmt_usd(args.large_usd as i128)
                 );
                 let mut head = String::from("| Capture \\ Impact |");
                 for &imp in IMPACTS_SUB.iter() {
@@ -2628,6 +3075,7 @@ fn frontier(
                     decrypt_ms: dec,
                     react_ms: react,
                     cells,
+                    selection_bias_warn: bias_warn,
                 });
             }
         }
@@ -2635,8 +3083,8 @@ fn frontier(
     html_grids
 }
 
-fn render_mech_rows_html(specs: &[Spec], totals: &[Agg], shift: i64) -> String {
-    let e0 = base_econ();
+fn render_mech_rows_html(specs: &[Spec], totals: &[Agg], shift: i64, args: &Args) -> String {
+    let e0 = base_econ(args);
     let mut rows = String::new();
     for (sp, a) in specs.iter().zip(totals.iter()) {
         if sp.shift != shift {
@@ -2672,7 +3120,7 @@ fn render_mech_rows_html(specs: &[Spec], totals: &[Agg], shift: i64) -> String {
                     html_escape(&fmt_opt(o.all_in_net)),
                     a.sniper_hit,
                     a.sniper_missed,
-                    a.tk_dropped,
+                    html_escape(&fmt_dropped_cell(a)),
                     a.batches
                 ));
             }
@@ -2706,8 +3154,18 @@ fn render_cohort_rows_html(specs: &[Spec], totals: &[Agg]) -> String {
         } else {
             "n/a".to_string()
         };
+        let large_pm = if a.tk_n > 0 {
+            a.tk_large_n * 1000 / a.tk_n
+        } else {
+            0
+        };
+        let exp_pm = if a.tk_large_n > 0 {
+            a.tk_large_exp_n * 1000 / a.tk_large_n
+        } else {
+            0
+        };
         rows.push_str(&format!(
-            "<tr{}><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+            "<tr{}><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
             tr_cls,
             html_escape(&sp.label),
             fmt_usd(a.mm_taker_n),
@@ -2717,13 +3175,15 @@ fn render_cohort_rows_html(specs: &[Spec], totals: &[Agg]) -> String {
             fmt_usd(diff_v),
             m_tk,
             m_st,
-            m_lt
+            m_lt,
+            fmt_permille(large_pm),
+            fmt_permille(exp_pm)
         ));
     }
     rows
 }
 
-fn mech_table_html(title: &str, rows_html: &str) -> String {
+fn mech_table_html(title: &str, rows_html: &str, wait_col_hdr: &str) -> String {
     format!(
         r#"<div class="table-card" style="margin-bottom: 22px;">
                 <h2>{}</h2>
@@ -2739,10 +3199,10 @@ fn mech_table_html(title: &str, rows_html: &str) -> String {
                             <th>s* Net</th>
                             <th>[1] Spread Paid</th>
                             <th>[2] Taker Stale</th>
-                            <th>[3] Informed Wait</th>
+                            <th>{}</th>
                             <th>[=] All-In Net</th>
                             <th>StaleSnipe Hit/Miss</th>
-                            <th>Dropped Takers</th>
+                            <th>Dropped Takers (USD%)</th>
                             <th>Batches</th>
                         </tr>
                     </thead>
@@ -2752,11 +3212,12 @@ fn mech_table_html(title: &str, rows_html: &str) -> String {
                 </table>
             </div>"#,
         html_escape(title),
+        html_escape(wait_col_hdr),
         rows_html
     )
 }
 
-fn render_placebo_html(specs: &[Spec], full: &[Agg], args: &Args) -> String {
+fn render_placebo_html(specs: &[Spec], full: &[Agg], args: &Args, wait_col_hdr: &str) -> String {
     let mut out = String::new();
     let lines = placebo_lines(specs, full, args);
     if lines.is_empty() {
@@ -2768,13 +3229,14 @@ fn render_placebo_html(specs: &[Spec], full: &[Agg], args: &Args) -> String {
     for l in &lines {
         out.push_str(&format!("<li>{}</li>", html_escape(l)));
     }
-    out.push_str("</ul></div>");
+    out.push_str("<li><strong>Reading:</strong> the part of the cancel-priority gap that survives the placebo does not depend on the flow predicting prices. The part that disappears depends on temporal alignment between real taker flow and price moves (and, with a trade-derived midpoint proxy, partly on construction).</li></ul></div>");
     for &s in &args.placebo_shifts {
-        let rows = render_mech_rows_html(specs, full, s);
+        let rows = render_mech_rows_html(specs, full, s, args);
         if !rows.is_empty() {
             out.push_str(&mech_table_html(
                 &format!("Placebo: takers shifted {}s (consolidated, MEV = 0)", s / 1000),
                 &rows,
+                wait_col_hdr,
             ));
         }
     }
@@ -2783,7 +3245,7 @@ fn render_placebo_html(specs: &[Spec], full: &[Agg], args: &Args) -> String {
 
 fn render_calibration_html() -> String {
     let mut out = String::from(
-        "<div class=\"bounds-box\"><h3>Calibration context (public documentation, retrieved 2026-11-18; not simulation inputs)</h3><ul>",
+        "<div class=\"bounds-box\"><h3>Calibration context (public documentation; not simulation inputs)</h3><ul>",
     );
     for (topic, statement, source) in CALIBRATION_NOTES.iter() {
         out.push_str(&format!(
@@ -2797,6 +3259,25 @@ fn render_calibration_html() -> String {
     out
 }
 
+fn format_proxy_diag(diag: &ProxyDiag) -> String {
+    if diag.total_obs == 0 {
+        return String::new();
+    }
+    let crossed_pm = (diag.crossed_obs as i128) * 1000 / (diag.total_obs as i128);
+    let mean_spread_q = if diag.valid_spread_obs > 0 {
+        diag.spread_sum_sub * Q / (diag.valid_spread_obs as i128)
+    } else {
+        0
+    };
+    format!(
+        "BidAskProxy diagnostics: {} total observations, {} crossed ({} where ask < bid), mean valid (ask - bid) spread = {} bps.",
+        diag.total_obs,
+        diag.crossed_obs,
+        fmt_permille(crossed_pm),
+        fmt_bps(mean_spread_q)
+    )
+}
+
 fn generate_html_report(
     output_path: &Path,
     args: &Args,
@@ -2805,6 +3286,7 @@ fn generate_html_report(
     days_reconstructed: usize,
     total_mid_ticks: usize,
     total_taker_orders: usize,
+    proxy_diag: &ProxyDiag,
     nblocks: usize,
     specs: &[Spec],
     per_sym: &[Vec<Vec<Agg>>],
@@ -2816,7 +3298,11 @@ fn generate_html_report(
         .map_err(|e| format!("Failed to create {}: {}", output_path.display(), e))?;
     let mut w = BufWriter::new(file);
 
-    let e0 = base_econ();
+    let e0 = base_econ(args);
+    let wait_col_hdr = match args.wait_cohort {
+        WaitCohort::All => "[3] Wait (All)",
+        WaitCohort::Large => "[3] Wait (Large)",
+    };
     let react0 = args.mm_react[0];
     let ia = find_spec(specs, Regime::Fifo, react0, 0, 0).unwrap_or(0);
     let ib = find_spec(specs, Regime::CancelPrio, react0, 0, 0).unwrap_or(0);
@@ -2858,9 +3344,10 @@ fn generate_html_report(
         impact_sub: 100,
         mm_share_ppm: 500_000,
         leak_ppm: 100_000,
-        rebate_sub: 50,
-        opex_sub: 30,
+        rebate_sub: args.rebate_sub,
+        opex_sub: args.opex_sub,
         horizon: 2,
+        wait_cohort: args.wait_cohort,
     };
     let mid_scenario_delta = delta_all_in(&full[ib], &full[id35], &e_mid)
         .map_or("n/a".to_string(), |d| format!("{} bps", fmt_bps_signed(d)));
@@ -2895,20 +3382,21 @@ fn generate_html_report(
     let sym1_name = html_escape(&args.symbols.get(0).cloned().unwrap_or_else(|| "BTCUSDT".to_string()));
     let sym2_name = html_escape(&args.symbols.get(1).cloned().unwrap_or_else(|| "ETHUSDT".to_string()));
 
-    let cons_rows_html = render_mech_rows_html(specs, full, 0);
+    let cons_rows_html = render_mech_rows_html(specs, full, 0, args);
     let cons_cohort_html = render_cohort_rows_html(specs, full);
 
     let mut per_sym_sections_html = String::new();
     for (s_idx, sym_name) in args.symbols.iter().enumerate() {
         let tot: Vec<Agg> = per_sym[s_idx].iter().map(|c| total(c)).collect();
-        let rows_html = render_mech_rows_html(specs, &tot, 0);
+        let rows_html = render_mech_rows_html(specs, &tot, 0, args);
         per_sym_sections_html.push_str(&mech_table_html(
             &format!("{} — Pure Microstructure Mechanics (MEV = 0)", sym_name),
             &rows_html,
+            wait_col_hdr,
         ));
     }
 
-    let placebo_html = render_placebo_html(specs, full, args);
+    let placebo_html = render_placebo_html(specs, full, args, wait_col_hdr);
     let calibration_html = render_calibration_html();
 
     let ratio_lines = gap_vs_ratio_lines(specs, full, args);
@@ -2920,6 +3408,10 @@ fn generate_html_report(
         }
         ratio_html.push_str("</ul></div>");
     }
+
+    let rebate_bps = fmt_bps(args.rebate_sub * Q);
+    let opex_bps = fmt_bps(args.opex_sub * Q);
+    let large_usd_str = fmt_usd(args.large_usd as i128);
 
     let mut frontier_cards_html = String::new();
     for fg in html_grids {
@@ -2939,11 +3431,21 @@ fn generate_html_report(
             }
             tbody.push_str("</tr>\n");
         }
+        let bias_html = match fg.selection_bias_warn {
+            Some(ref msg) => format!(
+                "<div class=\"warn-banner\" style=\"margin-bottom: 12px;\"><strong>WARNING (Selection Bias):</strong> {}</div>",
+                html_escape(msg)
+            ),
+            None => String::new(),
+        };
         frontier_cards_html.push_str(&format!(
             r#"<div class="table-card" style="margin-bottom: 20px;">
                 <h2>Break-Even Frontier: All-In(D) &minus; All-In(B) (bps) &mdash; Decrypt {}ms | React {}ms</h2>
+                {}
                 <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
-                    Assumptions: MM MEV Loss Share = 50%, Cancel-Header Leakage = 10%, Maker Rebate = +0.50 bps revenue, Hedge OpEx = 0.30 bps, Pending Policy = <code>{}</code>, Mid Mode = <code>{}</code>.
+                    Assumptions: MM MEV Loss Share = 50%, Cancel-Header Leakage = 10%, Maker Rebate = +{} bps revenue, Hedge OpEx = {} bps, Large Threshold = {}, B Order = <code>{}</code>, D Order = <code>{}</code>, Pending = <code>{}</code>, Mid = <code>{}</code>, Wait = <code>{}</code>.<br>
+                    <strong>D&lt;B</strong> (purple): Dywe cheaper for takers (95% CI &lt; 0); <strong>B&lt;D</strong> (amber): Regime B cheaper; <strong>~</strong>: statistically indistinguishable.
+                    <strong>Every cell with capture &gt; 0% is a parameterized scenario output, not a measurement.</strong>
                 </p>
                 <table>
                     <thead>
@@ -2963,8 +3465,15 @@ fn generate_html_report(
             </div>"#,
             fg.decrypt_ms,
             fg.react_ms,
+            bias_html,
+            rebate_bps,
+            opex_bps,
+            large_usd_str,
+            args.b_batch_order.as_str(),
+            args.d_batch_order.as_str(),
             args.pending_policy.as_str(),
             args.mid_mode.as_str(),
+            args.wait_cohort.as_str(),
             tbody
         ));
     }
@@ -2975,15 +3484,16 @@ fn generate_html_report(
         "L1 BookTicker Mid".to_string()
     };
 
+    let diag_str = format_proxy_diag(proxy_diag);
     let recon_banner = if days_reconstructed > 0 {
         format!(
             r#"<div class="warn-banner">
-                <strong>Methodological Note:</strong> {} of {} days used reconstructed L1 mid-prices (mode: <code>{}</code>) with pending policy <code>{}</code>.
+                <strong>Methodological Note on Mid-Price Source:</strong> {} of {} days used a trade-derived midpoint proxy (mode: <code>{}</code>) rather than actual L1 <code>bookTicker</code> quotes. A trade-derived midpoint retains partial correlation with execution flow by construction; inspect the placebo section below. {}
             </div>"#,
             days_reconstructed,
             days_ok,
             args.mid_mode.as_str(),
-            args.pending_policy.as_str()
+            html_escape(&diag_str)
         )
     } else {
         String::new()
@@ -2995,7 +3505,7 @@ fn generate_html_report(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dywe Protocol — Causal Microstructure &amp; Break-Even Ablation Report (v0.3.1)</title>
+    <title>Dywe Protocol — Causal Microstructure &amp; Break-Even Ablation Report (v0.3.3)</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <style>
         :root {{
@@ -3117,21 +3627,22 @@ fn generate_html_report(
 <body>
 <div class="container">
     <div class="top-bar">
-        <span class="brand-pill"><span class="brand-dot"></span>DYWE PROTOCOL // CAUSAL MICROSTRUCTURE RESEARCH (v0.3.1)</span>
-        <span class="engine-tag">PENDING={pending_pol} &bull; MID={mid_mode} &bull; DETERMINISTIC i128</span>
+        <span class="brand-pill"><span class="brand-dot"></span>DYWE PROTOCOL // CAUSAL MICROSTRUCTURE RESEARCH (v0.3.3)</span>
+        <span class="engine-tag">B={b_order} &bull; D={d_order} &bull; PENDING={pending_pol} &bull; WAIT={wait_cohort} &bull; DETERMINISTIC i128</span>
     </div>
 
     <header>
         <div class="title-group">
             <h1>DYWE EXCHANGE &mdash; CAUSAL MICROSTRUCTURE &amp; BREAK-EVEN ABLATION STUDY</h1>
-            <p>Scenario-Based Counterfactual Replay on Binance Futures flow ({syms}, {start} + {days}d | {nblocks} Joint {bh}h Bootstrap Blocks)</p>
+            <p>Scenario-Based Counterfactual Replay on Binance Futures flow ({syms}, {start} + {days}d | {nblocks} Joint {bh}h Bootstrap Blocks | Rebate +{rebate_bps}bp, OpEx {opex_bps}bp)</p>
         </div>
         <div class="meta-badges">
             <span class="badge">Pair-Days: <strong>{days_ok}/{total_tasks}</strong></span>
             <span class="badge">Mid Ticks: <strong>{total_mid_ticks}</strong></span>
             <span class="badge">Taker Flow: <strong>{total_taker_orders}</strong></span>
+            <span class="badge">B/D Order: <strong>{b_order}/{d_order}</strong></span>
             <span class="badge">Pending: <strong>{pending_pol}</strong></span>
-            <span class="badge">Mid Mode: <strong>{mid_mode}</strong></span>
+            <span class="badge">Wait: <strong>{wait_cohort}</strong></span>
             <span class="badge">Source: <strong>{data_source_badge}</strong></span>
         </div>
     </header>
@@ -3142,7 +3653,7 @@ fn generate_html_report(
         <div class="kpi-card">
             <div class="label">Net Half-Spread s* (MEV=0), Regime D ({d_dec}ms decrypt)</div>
             <div class="value">{d35_snet} bps</div>
-            <span class="kpi-pill">vs {a_snet} bps (FIFO) &amp; {b_snet} bps (Cancel-Prio {b_win}ms)</span>
+            <span class="kpi-pill">vs {a_snet} bps (FIFO) &amp; {b_snet} bps (Regime B {b_win}ms)</span>
         </div>
         <div class="kpi-card">
             <div class="label">1s MM Markout (MEV=0), Regime D</div>
@@ -3150,9 +3661,9 @@ fn generate_html_report(
             <span class="kpi-pill">vs {a_m1s} bps (FIFO); see placebo section</span>
         </div>
         <div class="kpi-card">
-            <div class="label">{d_dec}ms Decrypt Cost vs Cancel-Prio (Zero-MEV)</div>
+            <div class="label">{d_dec}ms Decrypt Cost vs Regime B (Zero-MEV)</div>
             <div class="value">{zero_mev_cost}</div>
-            <span class="kpi-pill">All-In Taker Cost delta</span>
+            <span class="kpi-pill">All-In Taker Cost delta (wait={wait_cohort})</span>
         </div>
         <div class="kpi-card">
             <div class="label">Scenario &Delta; All-In (25% capture, 1 bp, 10% leak)</div>
@@ -3188,10 +3699,10 @@ fn generate_html_report(
                     <th>s* Net</th>
                     <th>[1] Spread Paid</th>
                     <th>[2] Taker Stale</th>
-                    <th>[3] Informed Wait</th>
+                    <th>{wait_col_hdr}</th>
                     <th>[=] All-In Net</th>
                     <th>StaleSnipe Hit/Miss</th>
-                    <th>Dropped Takers</th>
+                    <th>Dropped Takers (USD%)</th>
                     <th>Batches</th>
                 </tr>
             </thead>
@@ -3200,7 +3711,7 @@ fn generate_html_report(
             </tbody>
         </table>
         <p style="margin-top: 10px; font-size: 11.5px; color: var(--text-muted);">
-            <strong>Identity (MEV = 0):</strong> <code>[1] Spread Paid + [2] Taker Stale + [3] Informed Wait = All-In Net</code>.
+            <strong>Identity (MEV = 0):</strong> <code>[1] Spread Paid + [2] Taker Stale + [3] Wait = All-In Net</code> (wait cohort: <code>{wait_cohort}</code>).
             <strong>Adverse selection check (Regime A, 1s markout):</strong> {sign_check_text}
         </p>
     </div>
@@ -3223,6 +3734,8 @@ fn generate_html_report(
                     <th>Taker 1s Markout</th>
                     <th>StaleSnipe 1s Markout</th>
                     <th>LateSnipe 1s Markout</th>
+                    <th>Large Vol % (&ge;{large_usd_str})</th>
+                    <th>Cancel-Batch Large %</th>
                 </tr>
             </thead>
             <tbody>
@@ -3237,6 +3750,18 @@ fn generate_html_report(
     {frontier_cards_html}
 
     {calibration_html}
+
+    <div class="bounds-box">
+        <h3>Methodological Scope &amp; Statistical Boundaries</h3>
+        <ul>
+            <li><strong>Regime D timeline:</strong> orders arrive at <code>arr_ns</code> inside a batch window, commit at <code>batch_close</code>, complete threshold decryption at <code>clear_ns = batch_close + decrypt_ms</code>, and clear in matching-engine memory using <code>{d_order}</code> ordering. Windows: B {b_win}ms ({b_order}), C {c_win}ms, D {d_win}ms ({d_order}).</li>
+            <li><strong>Selection bias under drop:</strong> when <code>pending=drop</code>, takers arriving during an MM cancel-replace gap are excluded from both MM markout and All-In Net; compare <code>Dropped Takers (USD%)</code> before comparing costs across regimes.</li>
+            <li><strong>Single-denominator additivity:</strong> <code>--wait-cohort all</code> (default) computes waiting drift over all executed takers (<code>tk_n</code>), matching the denominator of Spread Paid, Taker Stale, and MEV Taker.</li>
+            <li><strong>95% bootstrap CI:</strong> joint {bh}-hour block resampling across {sym1_name} and {sym2_name} ({nblocks} blocks). It reflects drift variance under fixed scenario assumptions and does not cover parameter uncertainty (capture, impact, leak, reaction times, windows).</li>
+            <li><strong>Encryption scope:</strong> encryption enters only through the MEV/leakage grid and the decryption wait. Cancel headers stay plaintext for head-of-batch priority; the header-leak probability is a scenario parameter (10% in the tables above), not a measured value.</li>
+            <li><strong>Other limits:</strong> exogenous taker flow (does not react to spread), one representative MM clearing the whole flow, threshold-bound sniper behaviour, single 7-day sample.</li>
+        </ul>
+    </div>
 </div>
 
 <script>
@@ -3251,7 +3776,7 @@ fn generate_html_report(
                 labels: horizons,
                 datasets: [
                     {{
-                        label: 'Regime D: IBTE + Cancel-Prio ({d_win}ms window, {d_dec}ms decrypt)',
+                        label: 'Regime D: IBTE ({d_win}ms, {d_dec}ms dec, {d_order})',
                         data: dD,
                         borderColor: '#c28aff',
                         backgroundColor: 'rgba(194, 138, 255, 0.12)',
@@ -3260,7 +3785,7 @@ fn generate_html_report(
                         tension: 0.2
                     }},
                     {{
-                        label: 'Regime B: Cancel-Priority ({b_win}ms)',
+                        label: 'Regime B: Batch ({b_win}ms, {b_order})',
                         data: dB,
                         borderColor: '#38bdf8',
                         borderWidth: 2,
@@ -3316,8 +3841,16 @@ fn generate_html_report(
         bh = args.block_hours,
         days_ok = days_ok,
         total_tasks = total_tasks,
+        total_mid_ticks = total_mid_ticks,
+        total_taker_orders = total_taker_orders,
+        b_order = args.b_batch_order.as_str(),
+        d_order = args.d_batch_order.as_str(),
         pending_pol = args.pending_policy.as_str(),
-        mid_mode = args.mid_mode.as_str(),
+        wait_cohort = args.wait_cohort.as_str(),
+        wait_col_hdr = html_escape(wait_col_hdr),
+        rebate_bps = rebate_bps,
+        opex_bps = opex_bps,
+        large_usd_str = html_escape(&large_usd_str),
         data_source_badge = data_source_badge,
         recon_banner = recon_banner,
         d35_snet = d35_snet,
@@ -3390,10 +3923,10 @@ fn main() {
     let specs = build_specs(&args);
     let mut rep = String::new();
 
-    emit!(rep, "# Dywe Microstructure Ablation — Scenario-Based Causal Backtest (v0.3.1)");
+    emit!(rep, "# Dywe Microstructure Ablation — Scenario-Based Causal Backtest (v0.3.3)");
     emit!(
         rep,
-        "Window: {} + {}d | Pairs: {} | Bootstrap Block: {}h ({} blocks) | Runs per (Pair, Day): {} | B window {}ms, D window {}ms, FBA window {}ms | pending={} | mid={} | placebo shifts (s): {:?}",
+        "Window: {} + {}d | Pairs: {} | Bootstrap Block: {}h ({} blocks) | Runs per (Pair, Day): {} | B {}ms ({}), D {}ms ({}), FBA {}ms | pending={} | mid={} | wait={} | rebate=+{}bp, opex={}bp, large>={} | placebo shifts (s): {:?}",
         args.start,
         args.days,
         args.symbols.join(","),
@@ -3401,10 +3934,16 @@ fn main() {
         nblocks,
         specs.len(),
         args.b_window(),
+        args.b_batch_order.as_str(),
         args.window_ms,
+        args.d_batch_order.as_str(),
         args.fba_window_ms,
         args.pending_policy.as_str(),
         args.mid_mode.as_str(),
+        args.wait_cohort.as_str(),
+        fmt_bps(args.rebate_sub * Q),
+        fmt_bps(args.opex_sub * Q),
+        fmt_usd(args.large_usd as i128),
         args.placebo_shifts.iter().map(|s| s / 1000).collect::<Vec<i64>>()
     );
 
@@ -3446,6 +3985,7 @@ fn main() {
     let mut days_reconstructed = 0usize;
     let mut total_mid_ticks = 0usize;
     let mut total_taker_orders = 0usize;
+    let mut total_proxy_diag = ProxyDiag::default();
 
     let res_vec = results.into_inner().unwrap_or_default();
     for (i, slot) in res_vec.into_iter().enumerate() {
@@ -3459,6 +3999,7 @@ fn main() {
                     days_ok += 1;
                     total_mid_ticks += r.mid_ticks;
                     total_taker_orders += r.taker_orders;
+                    total_proxy_diag.merge(&r.proxy_diag);
                     if r.reconstructed {
                         days_reconstructed += 1;
                     }
@@ -3485,6 +4026,15 @@ fn main() {
             emit!(rep, "- {}", s);
         }
     }
+    if days_reconstructed > 0 {
+        emit!(
+            rep,
+            "\n**NOTE:** {} pair-days used a trade-derived midpoint proxy (mode `{}`) because `bookTicker` files were not supplied. {}",
+            days_reconstructed,
+            args.mid_mode.as_str(),
+            format_proxy_diag(&total_proxy_diag)
+        );
+    }
 
     let mut combined: Vec<Vec<Agg>> = vec![vec![Agg::default(); nblocks]; specs.len()];
     for s in 0..nsym {
@@ -3499,13 +4049,31 @@ fn main() {
 
     for s in 0..nsym {
         let tot: Vec<Agg> = per_sym[s].iter().map(|c| total(c)).collect();
-        table(&mut rep, &format!("{} (MEV = 0)", args.symbols[s]), &specs, &tot, 0);
+        table(
+            &mut rep,
+            &format!("{} (MEV = 0)", args.symbols[s]),
+            &specs,
+            &tot,
+            0,
+            &args,
+        );
     }
-    table(&mut rep, "Consolidated Multi-Pair (MEV = 0)", &specs, &full, 0);
-    cohort_table(&mut rep, "Consolidated Multi-Pair", &specs, &full);
+    table(
+        &mut rep,
+        "Consolidated Multi-Pair (MEV = 0)",
+        &specs,
+        &full,
+        0,
+        &args,
+    );
+    cohort_table(&mut rep, "Consolidated Multi-Pair", &specs, &full, &args);
 
     if !args.placebo_shifts.is_empty() {
         emit!(rep, "\n## Placebo test: circularly shifted taker flow");
+        emit!(
+            rep,
+            "The taker flow is moved in time by the shift (wrapping inside each day) while the price path is untouched. Counts, sizes and sides are preserved; temporal alignment between flow and subsequent price moves is destroyed."
+        );
         for &s in &args.placebo_shifts {
             table(
                 &mut rep,
@@ -3513,12 +4081,17 @@ fn main() {
                 &specs,
                 &full,
                 s,
+                &args,
             );
         }
         emit!(rep, "\n### Real versus placebo cancel-priority gap (1s markout, positive = cancel-priority helps the MM)");
         for l in placebo_lines(&specs, &full, &args) {
             emit!(rep, "- {}", l);
         }
+        emit!(
+            rep,
+            "- Reading: what survives the placebo does not depend on the flow predicting prices. What disappears depends on the temporal alignment of real taker flow (and, with a trade-derived midpoint proxy, partly on construction)."
+        );
     }
 
     let ratio_lines = gap_vs_ratio_lines(&specs, &full, &args);
@@ -3570,13 +4143,26 @@ fn main() {
     }
 
     emit!(rep, "\n## Phase 2: Break-Even Frontier (MEV Scenario Assumptions)");
+    emit!(
+        rep,
+        "All cells with capture above 0% are parameterized scenario outputs (`capture × impact × mm_loss_share × leak`), not measurements. `breakeven.csv` contains the full 6×5×4×4 grid per decryption delay."
+    );
     let mut csv = String::new();
     let html_grids = frontier(&mut rep, &mut csv, &specs, &full, &boot, &args);
 
-    emit!(rep, "\n## Calibration context (public documentation, retrieved 2026-11-18; NOT simulation inputs)");
+    emit!(rep, "\n## Calibration context (public documentation; NOT simulation inputs)");
     for (topic, statement, source) in CALIBRATION_NOTES.iter() {
         emit!(rep, "- **{}:** {} _Source: {}_", topic, statement, source);
     }
+
+    emit!(rep, "\n## Methodological Boundaries & Scope");
+    emit!(rep, "- Regime D timeline: orders arrive inside a batch window, commit at `batch_close`, complete threshold decryption at `clear_ns = batch_close + decrypt_ms`, and clear in matching-engine memory using `--d-batch-order {}`.", args.d_batch_order.as_str());
+    emit!(rep, "- Regime B uses `--b-batch-order {}` (`hl` = New/post-only -> Cancel -> Taker/Sniper; `cancel-first` = Cancel -> New/Taker/Sniper).", args.b_batch_order.as_str());
+    emit!(rep, "- Single-denominator All-In Net: `--wait-cohort {}` (`all` uses total executed taker volume `tk_n` across all 4 components; `large` isolates waiting drift of large orders >= {}).", args.wait_cohort.as_str(), fmt_usd(args.large_usd as i128));
+    emit!(rep, "- Under `pending=drop`, dropped takers are excluded from both MM markout and All-In Net; inspect `Dropped Takers (USD%)` and selection-bias warnings before comparing costs.");
+    emit!(rep, "- 95% CI reflects drift variance across multi-hour blocks under FIXED scenario assumptions; parameter uncertainty (capture, impact, leak, reaction times, windows) is not covered.");
+    emit!(rep, "- Single 7-day sample window; BTCUSDT and ETHUSDT are strongly correlated and resampled jointly.");
+    emit!(rep, "- Taker flow is exogenous and invariant to spread width; one representative MM clears the full flow; sniper triggers are threshold-bound.");
 
     let out_dir = Path::new(&args.out_dir);
     let _ = std::fs::create_dir_all(out_dir);
@@ -3595,6 +4181,7 @@ fn main() {
         days_reconstructed,
         total_mid_ticks,
         total_taker_orders,
+        &total_proxy_diag,
         nblocks,
         &specs,
         &per_sym,
