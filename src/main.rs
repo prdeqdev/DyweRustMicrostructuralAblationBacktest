@@ -1,20 +1,3 @@
-//! dywe-ablation-sim v0.3.3 — SCENARIO-BASED CAUSAL MICROSTRUCTURE BACKTEST.
-//!
-//! New in v0.3.3:
-//!   * `--d-batch-order <hl|cancel-first>` (default: `hl`): distinguishes pre-commit encrypted
-//!     mempool privacy from post-decrypt in-memory matching (`New/ALO -> Cancel -> Taker`),
-//!     allowing both apples-to-apples (`B=hl` vs `D=hl`) and `cancel-first` stress runs.
-//!   * `--wait-cohort <all|large>` (default: `all`): ensures strict volume-weighted linear
-//!     additivity across all 4 All-In Net cost components over a single denominator (`tk_n`).
-//!   * Fixes `Regime C (FBA)` sniper attribution so late snipers arriving after MM requotes
-//!     are recorded as `sniper_late_fresh` rather than stale `sniper_hit`.
-//!   * Automatic selection-bias warning in `report.md`, `ablation_report.html`, and
-//!     `breakeven.csv` whenever `|dropped_USD%(B) - dropped_USD%(D)| >= 1.0%`.
-//!   * Natural sub-millisecond MM jitter `[0..999_999 ns]` allowing physical batch-boundary
-//!     splits between `Cancel` and `New`.
-//!   * Parameterizes `--rebate-sub`, `--opex-sub`, and `--large-usd` via CLI, adds `Large Vol %`
-//!     and `Cancel-Batch Large %` columns, fixes CSS wildcard reset, and expands tests to 14.
-
 #![allow(dead_code)]
 
 use std::collections::{HashSet, VecDeque};
