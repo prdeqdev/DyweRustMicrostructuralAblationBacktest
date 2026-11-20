@@ -1168,7 +1168,7 @@ fn evaluate(a: &Agg, regime: Regime, e: &Econ) -> Option<Outcome> {
     }
     // When ambient MEV capture is 0% (sterile zero-MEV baseline), no MEV extraction occurs
     // regardless of metadata leakage parameters.
-    let eff_leak = if e.capture_ppm == 0 { 0 } else { e.leak_ppm };
+    let eff_leak = e.leak_ppm.min(e.capture_ppm);
     let (p, large_mm, large_tk) = if regime == Regime::IbteCancelPrio {
         (eff_leak, a.mm_large_exp_n, a.tk_large_exp_n)
     } else {

@@ -1,3 +1,4 @@
+
 # Dywe Microstructural Ablation Backtest (`dywe-ablation-sim` · v0.3.4)
 
 **Deterministic, Fixed-Point (`i64`/`i128`) Causal Orderbook & Execution Replay Engine** benchmarking the **Dywe Exchange** micro-batch architecture against continuous FIFO and stylized open batch-auction designs across **30 pair-days** of historical Binance USDⓈ-M Futures market data:
