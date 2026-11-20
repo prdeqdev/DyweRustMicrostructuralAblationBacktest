@@ -154,6 +154,26 @@ impl MidMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MidSource {
+    /// Use native L1 bookTicker if present; fall back to trade proxy only when --allow-reconstructed is set.
+    Auto,
+    /// Require native L1 bookTicker CSVs; fail/skip if absent.
+    BookTicker,
+    /// Force trade-derived midpoint proxy even if bookTicker CSVs exist (enables same-day apples-to-apples validation).
+    Proxy,
+}
+
+impl MidSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            MidSource::Auto => "auto",
+            MidSource::BookTicker => "book",
+            MidSource::Proxy => "proxy",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WaitCohort {
     /// Volume-weighted waiting drift over ALL executed takers (denominator = tk_n).
     All,
@@ -184,6 +204,76 @@ impl ProxyDiag {
         self.crossed_obs += o.crossed_obs;
         self.valid_spread_obs += o.valid_spread_obs;
         self.spread_sum_sub += o.spread_sum_sub;
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BookTickerDiag {
+    files_loaded: usize,
+    raw_rows: usize,
+    same_ms_collapsed: usize,
+    unchanged_mid_skipped: usize,
+    distinct_mids: usize,
+    dt_sum_ms: i128,
+    dt_intervals: usize,
+    /// Exact 1-ms bucket histogram for inter-update intervals [0..=10_000 ms]; index 10_000 = >=10s.
+    dt_hist: Vec<usize>,
+}
+
+impl Default for BookTickerDiag {
+    fn default() -> Self {
+        Self {
+            files_loaded: 0,
+            raw_rows: 0,
+            same_ms_collapsed: 0,
+            unchanged_mid_skipped: 0,
+            distinct_mids: 0,
+            dt_sum_ms: 0,
+            dt_intervals: 0,
+            dt_hist: vec![0usize; 10_001],
+        }
+    }
+}
+
+impl BookTickerDiag {
+    fn record_intervals(&mut self, mids: &[Mid]) {
+        for w in mids.windows(2) {
+            let dt = (w[1].ts_ms - w[0].ts_ms).max(0);
+            self.dt_sum_ms += dt as i128;
+            self.dt_intervals += 1;
+            let bin = (dt as usize).min(10_000);
+            self.dt_hist[bin] += 1;
+        }
+    }
+
+    fn merge(&mut self, o: &BookTickerDiag) {
+        self.files_loaded += o.files_loaded;
+        self.raw_rows += o.raw_rows;
+        self.same_ms_collapsed += o.same_ms_collapsed;
+        self.unchanged_mid_skipped += o.unchanged_mid_skipped;
+        self.distinct_mids += o.distinct_mids;
+        self.dt_sum_ms += o.dt_sum_ms;
+        self.dt_intervals += o.dt_intervals;
+        if self.dt_hist.len() == o.dt_hist.len() {
+            for (a, b) in self.dt_hist.iter_mut().zip(o.dt_hist.iter()) {
+                *a += *b;
+            }
+        }
+    }
+
+    fn median_dt_ms(&self) -> Option<usize> {
+        if self.dt_intervals == 0 {
+            return None;
+        }
+        let target = self.dt_intervals / 2;
+        let mut cum = 0usize;
+        for (ms, &cnt) in self.dt_hist.iter().enumerate() {
+            cum += cnt;
+            if cum > target {
+                return Some(ms);
+            }
+        }
+        Some(10_000)
     }
 }
 
@@ -720,7 +810,7 @@ impl<'a> Sim<'a> {
                 });
             }
             BatchOrder::Hl => {
-                // Post-only first order:
+                // Post-only first order (executed in memory post-decrypt for Regime D):
                 // Class 0: New (ALO / post-only), Class 1: Cancel, Class 2: Taker / Sniper.
                 buf.sort_by_key(|e| {
                     let cls = match e.kind {
@@ -740,7 +830,6 @@ impl<'a> Sim<'a> {
 
     fn process_fba(&mut self, buf: &mut Vec<Ev>, clear_ns: i64) {
         let clear_ms = clear_ns / NS_PER_MS;
-        // Apply New before Cancel inside FBA quote updates to avoid dead gaps on same-batch requotes.
         for ev in buf.iter() {
             if let Kind::New { id, reff } = ev.kind {
                 self.apply_new(id, reff);
@@ -846,7 +935,6 @@ impl<'a> Sim<'a> {
                 }
             }
         }
-        // Accurate FBA sniper attribution: count as stale hit ONLY if quote ID was not refreshed.
         let current_id = self.proc.id;
         for &(_, _, tid) in snipers.iter() {
             if current_id == tid {
@@ -1078,8 +1166,11 @@ fn evaluate(a: &Agg, regime: Regime, e: &Econ) -> Option<Outcome> {
     if a.mm_n <= 0 || a.tk_n <= 0 {
         return None;
     }
+    // When ambient MEV capture is 0% (sterile zero-MEV baseline), no MEV extraction occurs
+    // regardless of metadata leakage parameters.
+    let eff_leak = if e.capture_ppm == 0 { 0 } else { e.leak_ppm };
     let (p, large_mm, large_tk) = if regime == Regime::IbteCancelPrio {
-        (e.leak_ppm, a.mm_large_exp_n, a.tk_large_exp_n)
+        (eff_leak, a.mm_large_exp_n, a.tk_large_exp_n)
     } else {
         (e.capture_ppm, a.mm_large_n, a.tk_large_n)
     };
@@ -1364,27 +1455,42 @@ fn half_tick_1e8(sym: &str) -> i64 {
     }
 }
 
-fn push_mid(v: &mut Vec<Mid>, ts: i64, mid: i64) {
+enum PushMidEvent {
+    Added,
+    SameMsCollapsed,
+    UnchangedMidSkipped,
+}
+
+fn push_mid_tracked(v: &mut Vec<Mid>, ts: i64, mid: i64) -> PushMidEvent {
     if let Some(l) = v.last_mut() {
         if l.ts_ms == ts {
             l.mid = mid;
-            return;
+            return PushMidEvent::SameMsCollapsed;
         }
         if l.mid == mid {
-            return;
+            return PushMidEvent::UnchangedMidSkipped;
         }
     }
     v.push(Mid { ts_ms: ts, mid });
+    PushMidEvent::Added
+}
+
+fn push_mid(v: &mut Vec<Mid>, ts: i64, mid: i64) {
+    let _ = push_mid_tracked(v, ts, mid);
 }
 
 fn notional_usd(price: i64, qty: i64) -> i64 {
     ((price as i128 * qty as i128) / (PRICE_SCALE as i128 * QTY_SCALE as i128)) as i64
 }
 
-fn load_book_ticker(path: &Path) -> Result<Vec<Mid>, String> {
+fn load_book_ticker(path: &Path) -> Result<(Vec<Mid>, BookTickerDiag), String> {
     let file = File::open(path).map_err(|e| format!("open {}: {}", path.display(), e))?;
     let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
     let mut out: Vec<Mid> = Vec::with_capacity(4_000_000);
+    let mut diag = BookTickerDiag {
+        files_loaded: 1,
+        ..BookTickerDiag::default()
+    };
     let (mut c_bid, mut c_ask, mut c_ts) = (1usize, 3usize, 5usize);
     let mut first = true;
     for line_res in reader.lines() {
@@ -1425,12 +1531,19 @@ fn load_book_ticker(path: &Path) -> Result<Vec<Mid>, String> {
         }
         if let (Some(b), Some(a), Some(ts)) = (bid, ask, ts) {
             if b > 0 && a >= b {
-                push_mid(&mut out, ts, (b + a) / 2);
+                diag.raw_rows += 1;
+                match push_mid_tracked(&mut out, ts, (b + a) / 2) {
+                    PushMidEvent::Added => {}
+                    PushMidEvent::SameMsCollapsed => diag.same_ms_collapsed += 1,
+                    PushMidEvent::UnchangedMidSkipped => diag.unchanged_mid_skipped += 1,
+                }
             }
         }
     }
     out.sort_by_key(|m| m.ts_ms);
-    Ok(out)
+    diag.distinct_mids = out.len();
+    diag.record_intervals(&out);
+    Ok((out, diag))
 }
 
 fn merge_taker(takers: &mut Vec<Taker>, ts: i64, dir: i8, notional: i64) {
@@ -1603,10 +1716,12 @@ struct Args {
     b_batch_order: BatchOrder,
     d_batch_order: BatchOrder,
     wait_cohort: WaitCohort,
+    mid_source: MidSource,
     mid_mode: MidMode,
     rebate_sub: i128,
     opex_sub: i128,
     large_usd: i64,
+    sniper_clip_usd: i64,
     block_hours: i64,
     allow_reconstructed: bool,
     bootstrap: usize,
@@ -1657,10 +1772,12 @@ fn parse_args() -> Args {
         b_batch_order: BatchOrder::Hl,
         d_batch_order: BatchOrder::Hl,
         wait_cohort: WaitCohort::All,
+        mid_source: MidSource::Auto,
         mid_mode: MidMode::BidAskProxy,
         rebate_sub: 50,
         opex_sub: 30,
         large_usd: 50_000,
+        sniper_clip_usd: 25_000,
         block_hours: 3,
         allow_reconstructed: false,
         bootstrap: 1000,
@@ -1715,6 +1832,18 @@ fn parse_args() -> Args {
                             std::process::exit(2);
                         }
                     },
+                    "--mid-source" => match val.trim().to_ascii_lowercase().as_str() {
+                        "auto" => a.mid_source = MidSource::Auto,
+                        "book" | "bookticker" => a.mid_source = MidSource::BookTicker,
+                        "proxy" => {
+                            a.mid_source = MidSource::Proxy;
+                            a.allow_reconstructed = true;
+                        }
+                        _ => {
+                            eprintln!("--mid-source must be 'auto', 'book', or 'proxy'");
+                            std::process::exit(2);
+                        }
+                    },
                     "--mid-mode" => match val.trim().to_ascii_lowercase().as_str() {
                         "bidask" => a.mid_mode = MidMode::BidAskProxy,
                         "trade" => a.mid_mode = MidMode::TradeHalfTick,
@@ -1726,6 +1855,7 @@ fn parse_args() -> Args {
                     "--rebate-sub" => a.rebate_sub = val.parse().unwrap_or(50),
                     "--opex-sub" => a.opex_sub = val.parse().unwrap_or(30),
                     "--large-usd" => a.large_usd = val.parse().unwrap_or(50_000),
+                    "--sniper-clip" => a.sniper_clip_usd = val.parse::<i64>().unwrap_or(25_000).max(0),
                     "--block-hours" => a.block_hours = val.parse().unwrap_or(3),
                     "--bootstrap" => a.bootstrap = val.parse().unwrap_or(1000),
                     "--threads" => a.threads = val.parse().unwrap_or(4),
@@ -1761,6 +1891,7 @@ fn push_core_specs(v: &mut Vec<Spec>, args: &Args, r: i64, shift: i64) {
     base.mm_react_ms = r;
     base.pending_policy = args.pending_policy;
     base.large_usd = args.large_usd;
+    base.sniper_clip_usd = args.sniper_clip_usd;
     let bw = args.b_window();
 
     let mut a = base;
@@ -1855,6 +1986,7 @@ struct DayResult {
     mid_ticks: usize,
     taker_orders: usize,
     proxy_diag: ProxyDiag,
+    book_diag: BookTickerDiag,
 }
 
 fn run_day(
@@ -1876,6 +2008,7 @@ fn run_day(
         mid_ticks: 0,
         taker_orders: 0,
         proxy_diag: ProxyDiag::default(),
+        book_diag: BookTickerDiag::default(),
     };
     let bt_s = format!("{}/{}-bookTicker-{}.csv", args.data_dir, sym, date);
     let tr_s = format!("{}/{}-trades-{}.csv", args.data_dir, sym, date);
@@ -1887,27 +2020,65 @@ fn run_day(
     let mut trade_takers: Option<Vec<Taker>> = None;
     let mut reconstructed = false;
     let mut proxy_diag = ProxyDiag::default();
-    let mids: Vec<Mid> = if bt.exists() {
-        match load_book_ticker(bt) {
-            Ok(m) => m,
-            Err(e) => return skip(format!("{} {}: {}", sym, date, e)),
-        }
-    } else if args.allow_reconstructed && tr.exists() {
-        match load_trades_csv(tr, half_tick_1e8(&sym), args.mid_mode) {
-            Ok((t, m, diag)) => {
-                trade_takers = Some(t);
-                reconstructed = true;
-                proxy_diag = diag;
-                m
+    let mut book_diag = BookTickerDiag::default();
+
+    let mids: Vec<Mid> = match args.mid_source {
+        MidSource::BookTicker => {
+            if bt.exists() {
+                match load_book_ticker(bt) {
+                    Ok((m, bd)) => {
+                        book_diag = bd;
+                        m
+                    }
+                    Err(e) => return skip(format!("{} {}: {}", sym, date, e)),
+                }
+            } else {
+                return skip(format!("{} {}: missing bookTicker (--mid-source book)", sym, date));
             }
-            Err(e) => return skip(format!("{} {}: {}", sym, date, e)),
         }
-    } else {
-        return skip(format!(
-            "{} {}: missing bookTicker (and --allow-reconstructed not set)",
-            sym, date
-        ));
+        MidSource::Proxy => {
+            if tr.exists() {
+                match load_trades_csv(tr, half_tick_1e8(&sym), args.mid_mode) {
+                    Ok((t, m, diag)) => {
+                        trade_takers = Some(t);
+                        reconstructed = true;
+                        proxy_diag = diag;
+                        m
+                    }
+                    Err(e) => return skip(format!("{} {}: {}", sym, date, e)),
+                }
+            } else {
+                return skip(format!("{} {}: missing trades CSV (--mid-source proxy)", sym, date));
+            }
+        }
+        MidSource::Auto => {
+            if bt.exists() {
+                match load_book_ticker(bt) {
+                    Ok((m, bd)) => {
+                        book_diag = bd;
+                        m
+                    }
+                    Err(e) => return skip(format!("{} {}: {}", sym, date, e)),
+                }
+            } else if args.allow_reconstructed && tr.exists() {
+                match load_trades_csv(tr, half_tick_1e8(&sym), args.mid_mode) {
+                    Ok((t, m, diag)) => {
+                        trade_takers = Some(t);
+                        reconstructed = true;
+                        proxy_diag = diag;
+                        m
+                    }
+                    Err(e) => return skip(format!("{} {}: {}", sym, date, e)),
+                }
+            } else {
+                return skip(format!(
+                    "{} {}: missing bookTicker (and --allow-reconstructed not set)",
+                    sym, date
+                ));
+            }
+        }
     };
+
     let takers: Vec<Taker> = if ag.exists() {
         match load_agg_trades_csv(ag) {
             Ok(t) => t,
@@ -1966,7 +2137,11 @@ fn run_day(
     let src_tag = if reconstructed {
         format!("RECONSTRUCTED({})", args.mid_mode.as_str())
     } else {
-        "bookTicker".to_string()
+        format!(
+            "bookTicker(raw={}, med_dt={}ms)",
+            book_diag.raw_rows,
+            book_diag.median_dt_ms().unwrap_or(0)
+        )
     };
     let line = format!(
         "[OK] {:<8} {} | mid ticks {:>9} | takers {:>8} | source: {} | {:.1?}",
@@ -1985,14 +2160,15 @@ fn run_day(
         mid_ticks: mids.len(),
         taker_orders: takers.len(),
         proxy_diag,
+        book_diag,
     }
 }
 
 // ============================================================================
-// Calibration context (static notes from public documentation)
+// Calibration & Design Notes (separated: external docs vs. Dywe parameters)
 // ============================================================================
 
-const CALIBRATION_NOTES: [(&str, &str, &str); 6] = [
+const EXTERNAL_CALIBRATION_NOTES: [(&str, &str, &str); 4] = [
     (
         "Hyperliquid: intra-batch priority order",
         "Official docs (hyperliquid-l1/order-book) state that within each consensus batch, non-GTC/IOC actions (i.e. post-only / ALO) are processed first, followed by cancels, followed by GTC/IOC orders. Thus new MM post-only quotes land before cancels and takers without a dead gap. Model this with `--b-batch-order hl`.",
@@ -2009,19 +2185,24 @@ const CALIBRATION_NOTES: [(&str, &str, &str); 6] = [
         "https://docs.dydx.xyz/concepts/onboarding-faqs",
     ),
     (
-        "Not documented (stay assumptions)",
+        "Not documented (stay parameterized assumptions)",
         "No venue documentation specifies MM reaction time, market-data feed latency, client-to-sequencer network transit, or latency-arbitrageur reaction time. Defaults (feed 5 ms, MM reaction 10 ms, sniper reaction 2 ms, network 30 ms) are parameterized assumptions; sweep `--mm-react` rather than trusting a single point.",
         "n/a",
     ),
+];
+
+const DYWE_DESIGN_NOTES: [(&str, &str); 3] = [
     (
-        "Dywe window & post-decrypt matching",
-        "The 50 ms micro-batch and 35 ms / 70 ms decryption RTTs are Dywe design parameters, not live multi-region Devnet measurements. Because threshold decryption completes in matching-engine memory BEFORE the first fill at `clear_ns`, Dywe can execute `hl` post-only-first ordering (`--d-batch-order hl`) without leaking ALO/IOC flags pre-commit. Use `--d-batch-order cancel-first` to stress-test strict pre-decrypt cancel-only sorting.",
-        "n/a",
+        "Dywe micro-batch window & threshold decryption RTT",
+        "The 50 ms micro-batch window and 35 ms / 70 ms threshold decryption RTTs are Dywe protocol design parameters, not live multi-region Devnet measurements.",
+    ),
+    (
+        "Unified post-decrypt threat model",
+        "All order messages (New ALO, Cancel, Taker) are threshold-encrypted client-side (BLS12-381) until batch_close. Threshold decryption completes in matching-engine memory at clear_ns = batch_close + decrypt_ms before the first fill executes, enabling deterministic New (ALO) -> Cancel -> Taker ordering (--d-batch-order hl) without leaking ALO/IOC flags pre-commit. The leak_ppm grid models potential residual side-channel/timing leakage on batches with MM cancels (0% under full cryptographic payload/metadata padding; 10%-50% stress sensitivity).",
     ),
     (
         "Stylized model disclaimer",
         "Regimes B (70 ms / 200 ms / 1000 ms) are stylized batching models, not byte-for-byte reproductions of Hyperliquid or dYdX matching engines.",
-        "n/a",
     ),
 ];
 
@@ -2455,8 +2636,6 @@ mod selfcheck {
         ))
     }
 
-    /// Verifies that Regime D with post-decrypt `hl` ordering and `decrypt_ms=0` matches
-    /// Regime B (`hl`) bit-for-bit and eliminates artificial same-batch cancel-gap drops.
     pub fn d_post_decrypt_hl_order() -> Result<String, String> {
         let (mids, takers) = synth(79, 150_000);
         let mut cfg_b = default_cfg();
@@ -2491,11 +2670,9 @@ mod selfcheck {
         ))
     }
 
-    /// Verifies that in Regime C (Uniform-Price FBA), a sniper arriving in the same batch as
-    /// MM's requote is counted as `sniper_late_fresh` rather than a stale `sniper_hit`.
     pub fn fba_sniper_attribution() -> Result<String, String> {
         let base_p = 100 * PRICE_SCALE;
-        let jump_p = 100 * PRICE_SCALE + 30_000_000; // +30 bps (> sniper_thr 200 sub & requote 150 sub)
+        let jump_p = 100 * PRICE_SCALE + 30_000_000;
         let mids = vec![
             Mid { ts_ms: 0, mid: base_p },
             Mid { ts_ms: 10, mid: jump_p },
@@ -2520,7 +2697,6 @@ mod selfcheck {
         Ok("FBA sniper arriving after same-batch MM requote attributed to late_fresh (0 stale hits)".to_string())
     }
 
-    /// Verifies exact single-denominator linearity under `WaitCohort::All` vs `WaitCohort::Large`.
     pub fn wait_cohort_all_identity() -> Result<String, String> {
         let a = Agg {
             mm_n: 1_000_000,
@@ -2528,9 +2704,9 @@ mod selfcheck {
             tk_n: 1_000_000,
             tk_scoef_w: 1_000_000,
             tk_stale_w: -20_000_000,
-            tk_wait_all_w: 50_000_000,  // 0.500 bps across all takers
+            tk_wait_all_w: 50_000_000,
             tk_inf_n: 200_000,
-            tk_inf_wait_w: 30_000_000,  // 1.500 bps across large takers
+            tk_inf_wait_w: 30_000_000,
             ..Agg::default()
         };
         let e_all = Econ {
@@ -2584,8 +2760,68 @@ mod selfcheck {
         Ok("normal midpoint and crossed-side fallback + diagnostics verified".to_string())
     }
 
+    pub fn book_ticker_diag() -> Result<String, String> {
+        let mut v: Vec<Mid> = Vec::new();
+        let mut d = BookTickerDiag::default();
+        // 5 raw ticks: 2 same-ms, 1 unchanged mid, 3 distinct mids at ts=10, 12, 16 -> intervals 2ms, 4ms (median 4ms)
+        let ticks = [
+            (10i64, 100 * PRICE_SCALE),
+            (10i64, 101 * PRICE_SCALE), // same ms collapsed
+            (11i64, 101 * PRICE_SCALE), // unchanged mid skipped
+            (12i64, 102 * PRICE_SCALE), // added (dt=2)
+            (16i64, 103 * PRICE_SCALE), // added (dt=4)
+        ];
+        for (ts, mid) in ticks {
+            d.raw_rows += 1;
+            match push_mid_tracked(&mut v, ts, mid) {
+                PushMidEvent::Added => {}
+                PushMidEvent::SameMsCollapsed => d.same_ms_collapsed += 1,
+                PushMidEvent::UnchangedMidSkipped => d.unchanged_mid_skipped += 1,
+            }
+        }
+        d.distinct_mids = v.len();
+        d.record_intervals(&v);
+        if d.raw_rows != 5
+            || d.same_ms_collapsed != 1
+            || d.unchanged_mid_skipped != 1
+            || d.distinct_mids != 3
+            || d.median_dt_ms() != Some(4)
+        {
+            return Err(format!("book_ticker_diag mismatch: {:?}", d));
+        }
+        Ok("raw_rows, deduplication counters, and median_dt_ms verified".to_string())
+    }
+
+    pub fn zero_capture_zero_mev() -> Result<String, String> {
+        let a = Agg {
+            mm_n: 1_000_000,
+            tk_n: 1_000_000,
+            mm_large_exp_n: 500_000,
+            tk_large_exp_n: 500_000,
+            ..Agg::default()
+        };
+        let e = Econ {
+            capture_ppm: 0,
+            impact_sub: 300,
+            mm_share_ppm: 500_000,
+            leak_ppm: 500_000,
+            rebate_sub: 50,
+            opex_sub: 30,
+            horizon: 2,
+            wait_cohort: WaitCohort::All,
+        };
+        let o = evaluate(&a, Regime::IbteCancelPrio, &e).ok_or("evaluate None")?;
+        if o.mev_mm_q != 0 || o.mev_tk_q != 0 {
+            return Err(format!(
+                "zero_capture_zero_mev: expected 0 MEV when capture=0, got mm={}, tk={}",
+                o.mev_mm_q, o.mev_tk_q
+            ));
+        }
+        Ok("capture=0% enforces zero MEV extraction regardless of leak_ppm".to_string())
+    }
+
     pub fn run_all() -> bool {
-        let checks: [(&str, fn() -> Result<String, String>); 13] = [
+        let checks: [(&str, fn() -> Result<String, String>); 15] = [
             ("causality (no look-ahead)", causality),
             ("identity D==B (decrypt=0, mev=0, leak=0)", identity),
             ("shuffled-side zero-spread + sign control", shuffled_zero_spread),
@@ -2599,6 +2835,8 @@ mod selfcheck {
             ("FBA sniper stale vs late_fresh attribution", fba_sniper_attribution),
             ("WaitCohort::All single-denominator identity", wait_cohort_all_identity),
             ("BidAskProxy midpoint & crossed diagnostics", bidask_mid_proxy),
+            ("BookTicker raw/dedup/interval diagnostics", book_ticker_diag),
+            ("Zero capture enforces zero MEV under leak>0", zero_capture_zero_mev),
         ];
         let mut ok = true;
         for (name, f) in checks.iter() {
@@ -2669,6 +2907,14 @@ mod tests {
     #[test]
     fn t_bidask_mid_proxy() {
         selfcheck::bidask_mid_proxy().unwrap();
+    }
+    #[test]
+    fn t_book_ticker_diag() {
+        selfcheck::book_ticker_diag().unwrap();
+    }
+    #[test]
+    fn t_zero_capture_zero_mev() {
+        selfcheck::zero_capture_zero_mev().unwrap();
     }
     #[test]
     fn t_html_escape() {
@@ -2821,7 +3067,7 @@ fn cohort_table(rep: &mut String, title: &str, specs: &[Spec], totals: &[Agg], a
     }
     emit!(
         rep,
-        "\nReconciliation note: `StaleSnipe` represents orders hitting the exact un-updated quote ID targeted at trigger time; `LateSnipe` represents sniper orders arriving after MM already requoted. In Regime C (Uniform-Price FBA), taker and sniper orders net internally into a single imbalance before clearing against the MM, so sniper volumes are absorbed into `Taker Vol` (net imbalance). `Cancel-Batch Large %` shows the share of large orders arriving inside a batch that also contains an MM cancel (the exposure base for `leak_ppm` in Regime D)."
+        "\nReconciliation note: `Taker Vol` reflects historical exchange flow (`aggTrades`/`trades`); `StaleSnipe` and `LateSnipe` reflect the parameterized latency-arb probe (`--sniper-clip`, default $25,000). In Regime C (Uniform-Price FBA), taker and sniper orders net internally into a single imbalance before clearing against the MM. `Cancel-Batch Large %` shows the share of large orders arriving inside a batch that also contains an MM cancel."
     );
 }
 
@@ -2920,7 +3166,7 @@ fn frontier(
     args: &Args,
 ) -> Vec<FrontierGrid> {
     let mut html_grids = Vec::new();
-    csv.push_str("react_ms,decrypt_ms,b_window_ms,d_window_ms,b_batch_order,d_batch_order,pending_policy,mid_mode,wait_cohort,rebate_sub,opex_sub,b_dropped_usd_pm,d_dropped_usd_pm,capture_ppm,impact_sub,mm_share_ppm,leak_ppm,allin_B_q,allin_D_q,delta_D_minus_B_q,ci_lo_q,ci_hi_q,verdict\n");
+    csv.push_str("react_ms,decrypt_ms,b_window_ms,d_window_ms,b_batch_order,d_batch_order,pending_policy,mid_source,mid_mode,wait_cohort,rebate_sub,opex_sub,b_dropped_usd_pm,d_dropped_usd_pm,capture_ppm,impact_sub,mm_share_ppm,leak_ppm,allin_B_q,allin_D_q,delta_D_minus_B_q,ci_lo_q,ci_hi_q,verdict\n");
     for &react in &args.mm_react {
         let ib = match find_spec(specs, Regime::CancelPrio, react, 0, 0) {
             Some(i) => i,
@@ -2980,7 +3226,7 @@ fn frontier(
                                 None => (String::new(), String::new()),
                             };
                             csv.push_str(&format!(
-                                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                                 react,
                                 dec,
                                 bw,
@@ -2988,6 +3234,7 @@ fn frontier(
                                 args.b_batch_order.as_str(),
                                 args.d_batch_order.as_str(),
                                 args.pending_policy.as_str(),
+                                args.mid_source.as_str(),
                                 args.mid_mode.as_str(),
                                 args.wait_cohort.as_str(),
                                 args.rebate_sub,
@@ -3018,7 +3265,7 @@ fn frontier(
             if react == args.mm_react[0] {
                 emit!(
                     rep,
-                    "\n#### Break-Even Frontier: All-In(D) − All-In(B) (bps) | B {}ms ({}), D {}ms (dec {}ms, {}) | react {}ms | pending={} | mid={} | wait={}",
+                    "\n#### Break-Even Frontier: All-In(D) − All-In(B) (bps) | B {}ms ({}), D {}ms (dec {}ms, {}) | react {}ms | pending={} | src={} | wait={}",
                     bw,
                     args.b_batch_order.as_str(),
                     dw,
@@ -3026,7 +3273,7 @@ fn frontier(
                     args.d_batch_order.as_str(),
                     react,
                     args.pending_policy.as_str(),
-                    args.mid_mode.as_str(),
+                    args.mid_source.as_str(),
                     args.wait_cohort.as_str()
                 );
                 if let Some(ref warn_msg) = bias_warn {
@@ -3212,7 +3459,7 @@ fn render_placebo_html(specs: &[Spec], full: &[Agg], args: &Args, wait_col_hdr: 
     for l in &lines {
         out.push_str(&format!("<li>{}</li>", html_escape(l)));
     }
-    out.push_str("<li><strong>Reading:</strong> the part of the cancel-priority gap that survives the placebo does not depend on the flow predicting prices. The part that disappears depends on temporal alignment between real taker flow and price moves (and, with a trade-derived midpoint proxy, partly on construction).</li></ul></div>");
+    out.push_str("<li><strong>Reading:</strong> circular shifting tests whether markout stems from temporal alignment between flow and subsequent price moves rather than static drift; it does not test midpoint reconstruction accuracy.</li></ul></div>");
     for &s in &args.placebo_shifts {
         let rows = render_mech_rows_html(specs, full, s, args);
         if !rows.is_empty() {
@@ -3228,14 +3475,22 @@ fn render_placebo_html(specs: &[Spec], full: &[Agg], args: &Args, wait_col_hdr: 
 
 fn render_calibration_html() -> String {
     let mut out = String::from(
-        "<div class=\"bounds-box\"><h3>Calibration context (public documentation; not simulation inputs)</h3><ul>",
+        "<div class=\"bounds-box\"><h3>External Venue Documentation &amp; Parameterized Assumptions</h3><ul>",
     );
-    for (topic, statement, source) in CALIBRATION_NOTES.iter() {
+    for (topic, statement, source) in EXTERNAL_CALIBRATION_NOTES.iter() {
         out.push_str(&format!(
             "<li><strong>{}:</strong> {} <em>Source: {}</em></li>",
             html_escape(topic),
             html_escape(statement),
             html_escape(source)
+        ));
+    }
+    out.push_str("</ul><h3 style=\"margin-top: 14px;\">Dywe Protocol Design Parameters &amp; Threat Model</h3><ul>");
+    for (topic, statement) in DYWE_DESIGN_NOTES.iter() {
+        out.push_str(&format!(
+            "<li><strong>{}:</strong> {}</li>",
+            html_escape(topic),
+            html_escape(statement)
         ));
     }
     out.push_str("</ul></div>");
@@ -3261,6 +3516,30 @@ fn format_proxy_diag(diag: &ProxyDiag) -> String {
     )
 }
 
+fn format_book_diag(diag: &BookTickerDiag) -> String {
+    if diag.files_loaded == 0 {
+        return String::new();
+    }
+    let med = diag
+        .median_dt_ms()
+        .map_or("n/a".to_string(), |m| format!("{} ms", m));
+    let mean_dt = if diag.dt_intervals > 0 {
+        format!("{:.2} ms", (diag.dt_sum_ms as f64) / (diag.dt_intervals as f64))
+    } else {
+        "n/a".to_string()
+    };
+    format!(
+        "Native L1 bookTicker diagnostics ({} files): {} raw quote rows -> {} distinct ms-level mid changes ({} same-ms collapsed, {} unchanged-mid skipped); inter-update interval median = {}, mean = {}.",
+        diag.files_loaded,
+        diag.raw_rows,
+        diag.distinct_mids,
+        diag.same_ms_collapsed,
+        diag.unchanged_mid_skipped,
+        med,
+        mean_dt
+    )
+}
+
 fn generate_html_report(
     output_path: &Path,
     args: &Args,
@@ -3270,6 +3549,7 @@ fn generate_html_report(
     total_mid_ticks: usize,
     total_taker_orders: usize,
     proxy_diag: &ProxyDiag,
+    book_diag: &BookTickerDiag,
     nblocks: usize,
     specs: &[Spec],
     per_sym: &[Vec<Vec<Agg>>],
@@ -3426,7 +3706,7 @@ fn generate_html_report(
                 <h2>Break-Even Frontier: All-In(D) &minus; All-In(B) (bps) &mdash; Decrypt {}ms | React {}ms</h2>
                 {}
                 <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
-                    Assumptions: MM MEV Loss Share = 50%, Cancel-Header Leakage = 10%, Maker Rebate = +{} bps revenue, Hedge OpEx = {} bps, Large Threshold = {}, B Order = <code>{}</code>, D Order = <code>{}</code>, Pending = <code>{}</code>, Mid = <code>{}</code>, Wait = <code>{}</code>.<br>
+                    Assumptions: MM MEV Loss Share = 50%, Side-Channel Leak = 10% (0% when capture = 0%), Maker Rebate = +{} bps revenue, Hedge OpEx = {} bps, Large Threshold = {}, B Order = <code>{}</code>, D Order = <code>{}</code>, Pending = <code>{}</code>, Source = <code>{}</code>, Wait = <code>{}</code>.<br>
                     <strong>D&lt;B</strong> (purple): Dywe cheaper for takers (95% CI &lt; 0); <strong>B&lt;D</strong> (amber): Regime B cheaper; <strong>~</strong>: statistically indistinguishable.
                     <strong>Every cell with capture &gt; 0% is a parameterized scenario output, not a measurement.</strong>
                 </p>
@@ -3455,7 +3735,7 @@ fn generate_html_report(
             args.b_batch_order.as_str(),
             args.d_batch_order.as_str(),
             args.pending_policy.as_str(),
-            args.mid_mode.as_str(),
+            args.mid_source.as_str(),
             args.wait_cohort.as_str(),
             tbody
         ));
@@ -3467,19 +3747,26 @@ fn generate_html_report(
         "L1 BookTicker Mid".to_string()
     };
 
-    let diag_str = format_proxy_diag(proxy_diag);
-    let recon_banner = if days_reconstructed > 0 {
-        format!(
-            r#"<div class="warn-banner">
-                <strong>Methodological Note on Mid-Price Source:</strong> {} of {} days used a trade-derived midpoint proxy (mode: <code>{}</code>) rather than actual L1 <code>bookTicker</code> quotes. A trade-derived midpoint retains partial correlation with execution flow by construction; inspect the placebo section below. {}
-            </div>"#,
+    let mut banner_parts: Vec<String> = Vec::new();
+    if book_diag.files_loaded > 0 {
+        banner_parts.push(html_escape(&format_book_diag(book_diag)));
+    }
+    if days_reconstructed > 0 {
+        banner_parts.push(format!(
+            "<strong>Methodological Note on Mid-Price Source:</strong> {} of {} days used a trade-derived midpoint proxy (mode: <code>{}</code>) rather than L1 <code>bookTicker</code> quotes. {}",
             days_reconstructed,
             days_ok,
             args.mid_mode.as_str(),
-            html_escape(&diag_str)
-        )
-    } else {
+            html_escape(&format_proxy_diag(proxy_diag))
+        ));
+    }
+    let recon_banner = if banner_parts.is_empty() {
         String::new()
+    } else {
+        format!(
+            "<div class=\"warn-banner\">{}</div>",
+            banner_parts.join("<br>")
+        )
     };
 
     let html = format!(
@@ -3488,7 +3775,7 @@ fn generate_html_report(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dywe Protocol — Causal Microstructure &amp; Break-Even Ablation Report (v0.3.3)</title>
+    <title>Dywe Protocol — Causal Microstructure &amp; Break-Even Ablation Report (v0.3.4)</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <style>
         :root {{
@@ -3610,8 +3897,8 @@ fn generate_html_report(
 <body>
 <div class="container">
     <div class="top-bar">
-        <span class="brand-pill"><span class="brand-dot"></span>DYWE PROTOCOL // CAUSAL MICROSTRUCTURE RESEARCH (v0.3.3)</span>
-        <span class="engine-tag">B={b_order} &bull; D={d_order} &bull; PENDING={pending_pol} &bull; WAIT={wait_cohort} &bull; DETERMINISTIC i128</span>
+        <span class="brand-pill"><span class="brand-dot"></span>DYWE PROTOCOL // CAUSAL MICROSTRUCTURE RESEARCH (v0.3.4)</span>
+        <span class="engine-tag">B={b_order} &bull; D={d_order} &bull; PENDING={pending_pol} &bull; SRC={mid_src} &bull; WAIT={wait_cohort} &bull; DETERMINISTIC i128</span>
     </div>
 
     <header>
@@ -3641,10 +3928,10 @@ fn generate_html_report(
         <div class="kpi-card">
             <div class="label">1s MM Markout (MEV=0), Regime D</div>
             <div class="value">{d35_m1s} bps</div>
-            <span class="kpi-pill">vs {a_m1s} bps (FIFO); see placebo section</span>
+            <span class="kpi-pill">vs {a_m1s} bps (FIFO); see cohort table</span>
         </div>
         <div class="kpi-card">
-            <div class="label">{d_dec}ms Decrypt Cost vs Regime B (Zero-MEV)</div>
+            <div class="label">{d_dec}ms Decrypt Taker Delta vs Regime B (Zero-MEV)</div>
             <div class="value">{zero_mev_cost}</div>
             <span class="kpi-pill">All-In Taker Cost delta (wait={wait_cohort})</span>
         </div>
@@ -3737,12 +4024,12 @@ fn generate_html_report(
     <div class="bounds-box">
         <h3>Methodological Scope &amp; Statistical Boundaries</h3>
         <ul>
-            <li><strong>Regime D timeline:</strong> orders arrive at <code>arr_ns</code> inside a batch window, commit at <code>batch_close</code>, complete threshold decryption at <code>clear_ns = batch_close + decrypt_ms</code>, and clear in matching-engine memory using <code>{d_order}</code> ordering. Windows: B {b_win}ms ({b_order}), C {c_win}ms, D {d_win}ms ({d_order}).</li>
+            <li><strong>Regime D timeline:</strong> all order fields (New ALO, Cancel, Taker) are threshold-encrypted pre-commit, commit at <code>batch_close</code>, complete threshold decryption at <code>clear_ns = batch_close + decrypt_ms</code>, and clear in matching-engine memory using <code>{d_order}</code> ordering. Windows: B {b_win}ms ({b_order}), C {c_win}ms, D {d_win}ms ({d_order}).</li>
+            <li><strong>Simulated latency-arb probe:</strong> StaleSnipe hits are generated by a deterministic parameterized probe (2 bps trigger, 2 ms reaction, ${sniper_clip} clip; configurable via <code>--sniper-clip</code>).</li>
             <li><strong>Selection bias under drop:</strong> when <code>pending=drop</code>, takers arriving during an MM cancel-replace gap are excluded from both MM markout and All-In Net; compare <code>Dropped Takers (USD%)</code> before comparing costs across regimes.</li>
             <li><strong>Single-denominator additivity:</strong> <code>--wait-cohort all</code> (default) computes waiting drift over all executed takers (<code>tk_n</code>), matching the denominator of Spread Paid, Taker Stale, and MEV Taker.</li>
             <li><strong>95% bootstrap CI:</strong> joint {bh}-hour block resampling across {sym1_name} and {sym2_name} ({nblocks} blocks). It reflects drift variance under fixed scenario assumptions and does not cover parameter uncertainty (capture, impact, leak, reaction times, windows).</li>
-            <li><strong>Encryption scope:</strong> encryption enters only through the MEV/leakage grid and the decryption wait. Cancel headers stay plaintext for head-of-batch priority; the header-leak probability is a scenario parameter (10% in the tables above), not a measured value.</li>
-            <li><strong>Other limits:</strong> exogenous taker flow (does not react to spread), one representative MM clearing the whole flow, threshold-bound sniper behaviour, single 7-day sample.</li>
+            <li><strong>Other limits:</strong> exogenous taker flow (invariant to spread width), one representative MM clearing the entire exchange flow, absolute <code>s*net</code> levels not directly comparable to real Binance tick spreads, and limited sample windows.</li>
         </ul>
     </div>
 </div>
@@ -3829,11 +4116,13 @@ fn generate_html_report(
         b_order = args.b_batch_order.as_str(),
         d_order = args.d_batch_order.as_str(),
         pending_pol = args.pending_policy.as_str(),
+        mid_src = args.mid_source.as_str(),
         wait_cohort = args.wait_cohort.as_str(),
         wait_col_hdr = html_escape(wait_col_hdr),
         rebate_bps = rebate_bps,
         opex_bps = opex_bps,
         large_usd_str = html_escape(&large_usd_str),
+        sniper_clip = args.sniper_clip_usd,
         data_source_badge = data_source_badge,
         recon_banner = recon_banner,
         d35_snet = d35_snet,
@@ -3906,10 +4195,10 @@ fn main() {
     let specs = build_specs(&args);
     let mut rep = String::new();
 
-    emit!(rep, "# Dywe Microstructure Ablation — Scenario-Based Causal Backtest (v0.3.3)");
+    emit!(rep, "# Dywe Microstructure Ablation — Scenario-Based Causal Backtest (v0.3.4)");
     emit!(
         rep,
-        "Window: {} + {}d | Pairs: {} | Bootstrap Block: {}h ({} blocks) | Runs per (Pair, Day): {} | B {}ms ({}), D {}ms ({}), FBA {}ms | pending={} | mid={} | wait={} | rebate=+{}bp, opex={}bp, large>={} | placebo shifts (s): {:?}",
+        "Window: {} + {}d | Pairs: {} | Bootstrap Block: {}h ({} blocks) | Runs per (Pair, Day): {} | B {}ms ({}), D {}ms ({}), FBA {}ms | pending={} | src={} | mid={} | wait={} | sniper_clip={} | rebate=+{}bp, opex={}bp, large>={} | placebo shifts (s): {:?}",
         args.start,
         args.days,
         args.symbols.join(","),
@@ -3922,8 +4211,10 @@ fn main() {
         args.d_batch_order.as_str(),
         args.fba_window_ms,
         args.pending_policy.as_str(),
+        args.mid_source.as_str(),
         args.mid_mode.as_str(),
         args.wait_cohort.as_str(),
+        fmt_usd(args.sniper_clip_usd as i128),
         fmt_bps(args.rebate_sub * Q),
         fmt_bps(args.opex_sub * Q),
         fmt_usd(args.large_usd as i128),
@@ -3969,6 +4260,7 @@ fn main() {
     let mut total_mid_ticks = 0usize;
     let mut total_taker_orders = 0usize;
     let mut total_proxy_diag = ProxyDiag::default();
+    let mut total_book_diag = BookTickerDiag::default();
 
     let res_vec = results.into_inner().unwrap_or_default();
     for (i, slot) in res_vec.into_iter().enumerate() {
@@ -3983,6 +4275,7 @@ fn main() {
                     total_mid_ticks += r.mid_ticks;
                     total_taker_orders += r.taker_orders;
                     total_proxy_diag.merge(&r.proxy_diag);
+                    total_book_diag.merge(&r.book_diag);
                     if r.reconstructed {
                         days_reconstructed += 1;
                     }
@@ -4009,11 +4302,15 @@ fn main() {
             emit!(rep, "- {}", s);
         }
     }
+    if total_book_diag.files_loaded > 0 {
+        emit!(rep, "\n**DATA DIAGNOSTICS:** {}", format_book_diag(&total_book_diag));
+    }
     if days_reconstructed > 0 {
         emit!(
             rep,
-            "\n**NOTE:** {} pair-days used a trade-derived midpoint proxy (mode `{}`) because `bookTicker` files were not supplied. {}",
+            "\n**NOTE:** {} pair-days used a trade-derived midpoint proxy (`--mid-source {}`, mode `{}`). {}",
             days_reconstructed,
+            args.mid_source.as_str(),
             args.mid_mode.as_str(),
             format_proxy_diag(&total_proxy_diag)
         );
@@ -4073,7 +4370,7 @@ fn main() {
         }
         emit!(
             rep,
-            "- Reading: what survives the placebo does not depend on the flow predicting prices. What disappears depends on the temporal alignment of real taker flow (and, with a trade-derived midpoint proxy, partly on construction)."
+            "- Reading: circular shifting tests whether markout stems from temporal alignment between flow and subsequent price moves rather than static drift; it does not validate midpoint reconstruction accuracy."
         );
     }
 
@@ -4128,24 +4425,29 @@ fn main() {
     emit!(rep, "\n## Phase 2: Break-Even Frontier (MEV Scenario Assumptions)");
     emit!(
         rep,
-        "All cells with capture above 0% are parameterized scenario outputs (`capture × impact × mm_loss_share × leak`), not measurements. `breakeven.csv` contains the full 6×5×4×4 grid per decryption delay."
+        "All cells with capture above 0% are parameterized scenario outputs (`capture × impact × mm_loss_share × leak`), not measurements. At `capture = 0%`, MEV extraction is strictly zero regardless of `leak_ppm`. `breakeven.csv` contains the full 6×5×4×4 grid per decryption delay."
     );
     let mut csv = String::new();
     let html_grids = frontier(&mut rep, &mut csv, &specs, &full, &boot, &args);
 
-    emit!(rep, "\n## Calibration context (public documentation; NOT simulation inputs)");
-    for (topic, statement, source) in CALIBRATION_NOTES.iter() {
+    emit!(rep, "\n## External Venue Documentation & Parameterized Assumptions (NOT simulation inputs)");
+    for (topic, statement, source) in EXTERNAL_CALIBRATION_NOTES.iter() {
         emit!(rep, "- **{}:** {} _Source: {}_", topic, statement, source);
     }
 
+    emit!(rep, "\n## Dywe Protocol Design Parameters & Threat Model");
+    for (topic, statement) in DYWE_DESIGN_NOTES.iter() {
+        emit!(rep, "- **{}:** {}", topic, statement);
+    }
+
     emit!(rep, "\n## Methodological Boundaries & Scope");
-    emit!(rep, "- Regime D timeline: orders arrive inside a batch window, commit at `batch_close`, complete threshold decryption at `clear_ns = batch_close + decrypt_ms`, and clear in matching-engine memory using `--d-batch-order {}`.", args.d_batch_order.as_str());
+    emit!(rep, "- Regime D timeline: all order fields (New ALO, Cancel, Taker) are threshold-encrypted pre-commit, commit at `batch_close`, complete threshold decryption at `clear_ns = batch_close + decrypt_ms`, and clear in matching-engine memory using `--d-batch-order {}`.", args.d_batch_order.as_str());
     emit!(rep, "- Regime B uses `--b-batch-order {}` (`hl` = New/post-only -> Cancel -> Taker/Sniper; `cancel-first` = Cancel -> New/Taker/Sniper).", args.b_batch_order.as_str());
     emit!(rep, "- Single-denominator All-In Net: `--wait-cohort {}` (`all` uses total executed taker volume `tk_n` across all 4 components; `large` isolates waiting drift of large orders >= {}).", args.wait_cohort.as_str(), fmt_usd(args.large_usd as i128));
+    emit!(rep, "- Simulated latency-arb probe: StaleSnipe hits are generated by a parameterized probe (`--sniper-clip`, default $25,000); set `--sniper-clip 0` to isolate historical taker flow.");
     emit!(rep, "- Under `pending=drop`, dropped takers are excluded from both MM markout and All-In Net; inspect `Dropped Takers (USD%)` and selection-bias warnings before comparing costs.");
     emit!(rep, "- 95% CI reflects drift variance across multi-hour blocks under FIXED scenario assumptions; parameter uncertainty (capture, impact, leak, reaction times, windows) is not covered.");
-    emit!(rep, "- Single 7-day sample window; BTCUSDT and ETHUSDT are strongly correlated and resampled jointly.");
-    emit!(rep, "- Taker flow is exogenous and invariant to spread width; one representative MM clears the full flow; sniper triggers are threshold-bound.");
+    emit!(rep, "- Exogenous taker flow (invariant to spread width); one representative MM clears the full exchange flow; absolute `s*net` levels are model-derived and not directly comparable to real Binance tick spreads.");
 
     let out_dir = Path::new(&args.out_dir);
     let _ = std::fs::create_dir_all(out_dir);
@@ -4165,6 +4467,7 @@ fn main() {
         total_mid_ticks,
         total_taker_orders,
         &total_proxy_diag,
+        &total_book_diag,
         nblocks,
         &specs,
         &per_sym,

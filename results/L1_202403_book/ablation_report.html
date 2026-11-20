@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dywe Protocol — Causal Microstructure &amp; Break-Even Ablation Report (v0.3.3)</title>
+    <title>Dywe Protocol — Causal Microstructure &amp; Break-Even Ablation Report (v0.3.4)</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <style>
         :root {
@@ -125,8 +125,8 @@
 <body>
 <div class="container">
     <div class="top-bar">
-        <span class="brand-pill"><span class="brand-dot"></span>DYWE PROTOCOL // CAUSAL MICROSTRUCTURE RESEARCH (v0.3.3)</span>
-        <span class="engine-tag">B=hl &bull; D=hl &bull; PENDING=drop &bull; WAIT=all &bull; DETERMINISTIC i128</span>
+        <span class="brand-pill"><span class="brand-dot"></span>DYWE PROTOCOL // CAUSAL MICROSTRUCTURE RESEARCH (v0.3.4)</span>
+        <span class="engine-tag">B=hl &bull; D=hl &bull; PENDING=drop &bull; SRC=book &bull; WAIT=all &bull; DETERMINISTIC i128</span>
     </div>
 
     <header>
@@ -145,7 +145,7 @@
         </div>
     </header>
 
-    
+    <div class="warn-banner">Native L1 bookTicker diagnostics (9 files): 74023564 raw quote rows -&gt; 3269988 distinct ms-level mid changes (4312026 same-ms collapsed, 66441550 unchanged-mid skipped); inter-update interval median = 3 ms, mean = 237.79 ms.</div>
 
     <div class="kpi-grid">
         <div class="kpi-card">
@@ -156,10 +156,10 @@
         <div class="kpi-card">
             <div class="label">1s MM Markout (MEV=0), Regime D</div>
             <div class="value">-0.782 bps</div>
-            <span class="kpi-pill">vs -1.312 bps (FIFO); see placebo section</span>
+            <span class="kpi-pill">vs -1.312 bps (FIFO); see cohort table</span>
         </div>
         <div class="kpi-card">
-            <div class="label">35ms Decrypt Cost vs Regime B (Zero-MEV)</div>
+            <div class="label">35ms Decrypt Taker Delta vs Regime B (Zero-MEV)</div>
             <div class="value">+0.005 bps</div>
             <span class="kpi-pill">All-In Taker Cost delta (wait=all)</span>
         </div>
@@ -220,7 +220,7 @@
         </p>
     </div>
 
-    <div class="bounds-box"><h3>Placebo test: circularly shifted taker flow</h3><ul><li>Real flow (react 10ms): A -1.312 bp, B -0.667 bp, cancel-priority gap (B minus A) 0.645 bp.</li><li>Placebo shift 600 s: A -0.036 bp, B -0.009 bp, gap 0.027 bp = 4.2% of the real gap.</li><li>Placebo shift 3600 s: A -0.045 bp, B -0.017 bp, gap 0.027 bp = 4.2% of the real gap.</li><li><strong>Reading:</strong> the part of the cancel-priority gap that survives the placebo does not depend on the flow predicting prices. The part that disappears depends on temporal alignment between real taker flow and price moves (and, with a trade-derived midpoint proxy, partly on construction).</li></ul></div><div class="table-card" style="margin-bottom: 22px;">
+    <div class="bounds-box"><h3>Placebo test: circularly shifted taker flow</h3><ul><li>Real flow (react 10ms): A -1.312 bp, B -0.667 bp, cancel-priority gap (B minus A) 0.645 bp.</li><li>Placebo shift 600 s: A -0.036 bp, B -0.009 bp, gap 0.027 bp = 4.2% of the real gap.</li><li>Placebo shift 3600 s: A -0.045 bp, B -0.017 bp, gap 0.027 bp = 4.2% of the real gap.</li><li><strong>Reading:</strong> circular shifting tests whether markout stems from temporal alignment between flow and subsequent price moves rather than static drift; it does not test midpoint reconstruction accuracy.</li></ul></div><div class="table-card" style="margin-bottom: 22px;">
                 <h2>Placebo: takers shifted 600s (consolidated, MEV = 0)</h2>
                 <table>
                     <thead>
@@ -416,7 +416,7 @@
                 <h2>Break-Even Frontier: All-In(D) &minus; All-In(B) (bps) &mdash; Decrypt 0ms | React 10ms</h2>
                 
                 <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
-                    Assumptions: MM MEV Loss Share = 50%, Cancel-Header Leakage = 10%, Maker Rebate = +0.500 bps revenue, Hedge OpEx = 0.300 bps, Large Threshold = $50,000, B Order = <code>hl</code>, D Order = <code>hl</code>, Pending = <code>drop</code>, Mid = <code>bidask</code>, Wait = <code>all</code>.<br>
+                    Assumptions: MM MEV Loss Share = 50%, Side-Channel Leak = 10% (0% when capture = 0%), Maker Rebate = +0.500 bps revenue, Hedge OpEx = 0.300 bps, Large Threshold = $50,000, B Order = <code>hl</code>, D Order = <code>hl</code>, Pending = <code>drop</code>, Source = <code>book</code>, Wait = <code>all</code>.<br>
                     <strong>D&lt;B</strong> (purple): Dywe cheaper for takers (95% CI &lt; 0); <strong>B&lt;D</strong> (amber): Regime B cheaper; <strong>~</strong>: statistically indistinguishable.
                     <strong>Every cell with capture &gt; 0% is a parameterized scenario output, not a measurement.</strong>
                 </p>
@@ -432,7 +432,7 @@
                         </tr>
                     </thead>
                     <tbody>
-                        <tr><td><strong>0%</strong></td><td class="cell-neutral">0.001 ~</td><td class="cell-loss">0.010 B&lt;D</td><td class="cell-loss">0.019 B&lt;D</td><td class="cell-loss">0.037 B&lt;D</td><td class="cell-loss">0.055 B&lt;D</td></tr>
+                        <tr><td><strong>0%</strong></td><td class="cell-neutral">0.001 ~</td><td class="cell-neutral">0.001 ~</td><td class="cell-neutral">0.001 ~</td><td class="cell-neutral">0.001 ~</td><td class="cell-neutral">0.001 ~</td></tr>
 <tr><td><strong>10%</strong></td><td class="cell-neutral">0.001 ~</td><td class="cell-win">-0.023 D&lt;B</td><td class="cell-win">-0.048 D&lt;B</td><td class="cell-win">-0.097 D&lt;B</td><td class="cell-win">-0.146 D&lt;B</td></tr>
 <tr><td><strong>25%</strong></td><td class="cell-neutral">0.001 ~</td><td class="cell-win">-0.073 D&lt;B</td><td class="cell-win">-0.149 D&lt;B</td><td class="cell-win">-0.300 D&lt;B</td><td class="cell-win">-0.450 D&lt;B</td></tr>
 <tr><td><strong>50%</strong></td><td class="cell-neutral">0.001 ~</td><td class="cell-win">-0.158 D&lt;B</td><td class="cell-win">-0.318 D&lt;B</td><td class="cell-win">-0.637 D&lt;B</td><td class="cell-win">-0.957 D&lt;B</td></tr>
@@ -445,7 +445,7 @@
                 <h2>Break-Even Frontier: All-In(D) &minus; All-In(B) (bps) &mdash; Decrypt 35ms | React 10ms</h2>
                 
                 <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
-                    Assumptions: MM MEV Loss Share = 50%, Cancel-Header Leakage = 10%, Maker Rebate = +0.500 bps revenue, Hedge OpEx = 0.300 bps, Large Threshold = $50,000, B Order = <code>hl</code>, D Order = <code>hl</code>, Pending = <code>drop</code>, Mid = <code>bidask</code>, Wait = <code>all</code>.<br>
+                    Assumptions: MM MEV Loss Share = 50%, Side-Channel Leak = 10% (0% when capture = 0%), Maker Rebate = +0.500 bps revenue, Hedge OpEx = 0.300 bps, Large Threshold = $50,000, B Order = <code>hl</code>, D Order = <code>hl</code>, Pending = <code>drop</code>, Source = <code>book</code>, Wait = <code>all</code>.<br>
                     <strong>D&lt;B</strong> (purple): Dywe cheaper for takers (95% CI &lt; 0); <strong>B&lt;D</strong> (amber): Regime B cheaper; <strong>~</strong>: statistically indistinguishable.
                     <strong>Every cell with capture &gt; 0% is a parameterized scenario output, not a measurement.</strong>
                 </p>
@@ -461,7 +461,7 @@
                         </tr>
                     </thead>
                     <tbody>
-                        <tr><td><strong>0%</strong></td><td class="cell-loss">0.005 B&lt;D</td><td class="cell-loss">0.014 B&lt;D</td><td class="cell-loss">0.023 B&lt;D</td><td class="cell-loss">0.041 B&lt;D</td><td class="cell-loss">0.059 B&lt;D</td></tr>
+                        <tr><td><strong>0%</strong></td><td class="cell-loss">0.005 B&lt;D</td><td class="cell-loss">0.005 B&lt;D</td><td class="cell-loss">0.005 B&lt;D</td><td class="cell-loss">0.005 B&lt;D</td><td class="cell-loss">0.005 B&lt;D</td></tr>
 <tr><td><strong>10%</strong></td><td class="cell-loss">0.005 B&lt;D</td><td class="cell-win">-0.019 D&lt;B</td><td class="cell-win">-0.044 D&lt;B</td><td class="cell-win">-0.093 D&lt;B</td><td class="cell-win">-0.143 D&lt;B</td></tr>
 <tr><td><strong>25%</strong></td><td class="cell-loss">0.005 B&lt;D</td><td class="cell-win">-0.070 D&lt;B</td><td class="cell-win">-0.145 D&lt;B</td><td class="cell-win">-0.296 D&lt;B</td><td class="cell-win">-0.447 D&lt;B</td></tr>
 <tr><td><strong>50%</strong></td><td class="cell-loss">0.005 B&lt;D</td><td class="cell-win">-0.154 D&lt;B</td><td class="cell-win">-0.314 D&lt;B</td><td class="cell-win">-0.634 D&lt;B</td><td class="cell-win">-0.953 D&lt;B</td></tr>
@@ -474,7 +474,7 @@
                 <h2>Break-Even Frontier: All-In(D) &minus; All-In(B) (bps) &mdash; Decrypt 70ms | React 10ms</h2>
                 
                 <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
-                    Assumptions: MM MEV Loss Share = 50%, Cancel-Header Leakage = 10%, Maker Rebate = +0.500 bps revenue, Hedge OpEx = 0.300 bps, Large Threshold = $50,000, B Order = <code>hl</code>, D Order = <code>hl</code>, Pending = <code>drop</code>, Mid = <code>bidask</code>, Wait = <code>all</code>.<br>
+                    Assumptions: MM MEV Loss Share = 50%, Side-Channel Leak = 10% (0% when capture = 0%), Maker Rebate = +0.500 bps revenue, Hedge OpEx = 0.300 bps, Large Threshold = $50,000, B Order = <code>hl</code>, D Order = <code>hl</code>, Pending = <code>drop</code>, Source = <code>book</code>, Wait = <code>all</code>.<br>
                     <strong>D&lt;B</strong> (purple): Dywe cheaper for takers (95% CI &lt; 0); <strong>B&lt;D</strong> (amber): Regime B cheaper; <strong>~</strong>: statistically indistinguishable.
                     <strong>Every cell with capture &gt; 0% is a parameterized scenario output, not a measurement.</strong>
                 </p>
@@ -490,7 +490,7 @@
                         </tr>
                     </thead>
                     <tbody>
-                        <tr><td><strong>0%</strong></td><td class="cell-loss">0.008 B&lt;D</td><td class="cell-loss">0.017 B&lt;D</td><td class="cell-loss">0.026 B&lt;D</td><td class="cell-loss">0.044 B&lt;D</td><td class="cell-loss">0.062 B&lt;D</td></tr>
+                        <tr><td><strong>0%</strong></td><td class="cell-loss">0.008 B&lt;D</td><td class="cell-loss">0.008 B&lt;D</td><td class="cell-loss">0.008 B&lt;D</td><td class="cell-loss">0.008 B&lt;D</td><td class="cell-loss">0.008 B&lt;D</td></tr>
 <tr><td><strong>10%</strong></td><td class="cell-loss">0.008 B&lt;D</td><td class="cell-win">-0.016 D&lt;B</td><td class="cell-win">-0.041 D&lt;B</td><td class="cell-win">-0.090 D&lt;B</td><td class="cell-win">-0.140 D&lt;B</td></tr>
 <tr><td><strong>25%</strong></td><td class="cell-loss">0.008 B&lt;D</td><td class="cell-win">-0.067 D&lt;B</td><td class="cell-win">-0.142 D&lt;B</td><td class="cell-win">-0.293 D&lt;B</td><td class="cell-win">-0.444 D&lt;B</td></tr>
 <tr><td><strong>50%</strong></td><td class="cell-loss">0.008 B&lt;D</td><td class="cell-win">-0.151 D&lt;B</td><td class="cell-win">-0.311 D&lt;B</td><td class="cell-win">-0.631 D&lt;B</td><td class="cell-win">-0.950 D&lt;B</td></tr>
@@ -501,17 +501,17 @@
                 </table>
             </div>
 
-    <div class="bounds-box"><h3>Calibration context (public documentation; not simulation inputs)</h3><ul><li><strong>Hyperliquid: intra-batch priority order:</strong> Official docs (hyperliquid-l1/order-book) state that within each consensus batch, non-GTC/IOC actions (i.e. post-only / ALO) are processed first, followed by cancels, followed by GTC/IOC orders. Thus new MM post-only quotes land before cancels and takers without a dead gap. Model this with `--b-batch-order hl`. <em>Source: https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-l1/order-book</em></li><li><strong>Hyperliquid: block interval &amp; buckets:</strong> Official docs (for-developers/api/priority-fees) state that IOC orders are sorted in 70 ms unix-time buckets, typically corresponding to one block (with 1-2 consensus batches per block, meaning effective batch windows may be shorter than 70 ms). End-to-end co-located latency is cited around ~0.2 s median in third-party mirrors. <em>Source: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/priority-fees ; https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/overview</em></li><li><strong>dYdX Chain (v4): block time:</strong> The official onboarding FAQ states an average block time of about 1 second, and that short-term order cancels are best effort until the block is final. Use `--b-window-ms 1000` to evaluate a 1-second batching cadence. <em>Source: https://docs.dydx.xyz/concepts/onboarding-faqs</em></li><li><strong>Not documented (stay assumptions):</strong> No venue documentation specifies MM reaction time, market-data feed latency, client-to-sequencer network transit, or latency-arbitrageur reaction time. Defaults (feed 5 ms, MM reaction 10 ms, sniper reaction 2 ms, network 30 ms) are parameterized assumptions; sweep `--mm-react` rather than trusting a single point. <em>Source: n/a</em></li><li><strong>Dywe window &amp; post-decrypt matching:</strong> The 50 ms micro-batch and 35 ms / 70 ms decryption RTTs are Dywe design parameters, not live multi-region Devnet measurements. Because threshold decryption completes in matching-engine memory BEFORE the first fill at `clear_ns`, Dywe can execute `hl` post-only-first ordering (`--d-batch-order hl`) without leaking ALO/IOC flags pre-commit. Use `--d-batch-order cancel-first` to stress-test strict pre-decrypt cancel-only sorting. <em>Source: n/a</em></li><li><strong>Stylized model disclaimer:</strong> Regimes B (70 ms / 200 ms / 1000 ms) are stylized batching models, not byte-for-byte reproductions of Hyperliquid or dYdX matching engines. <em>Source: n/a</em></li></ul></div>
+    <div class="bounds-box"><h3>External Venue Documentation &amp; Parameterized Assumptions</h3><ul><li><strong>Hyperliquid: intra-batch priority order:</strong> Official docs (hyperliquid-l1/order-book) state that within each consensus batch, non-GTC/IOC actions (i.e. post-only / ALO) are processed first, followed by cancels, followed by GTC/IOC orders. Thus new MM post-only quotes land before cancels and takers without a dead gap. Model this with `--b-batch-order hl`. <em>Source: https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-l1/order-book</em></li><li><strong>Hyperliquid: block interval &amp; buckets:</strong> Official docs (for-developers/api/priority-fees) state that IOC orders are sorted in 70 ms unix-time buckets, typically corresponding to one block (with 1-2 consensus batches per block, meaning effective batch windows may be shorter than 70 ms). End-to-end co-located latency is cited around ~0.2 s median in third-party mirrors. <em>Source: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/priority-fees ; https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/overview</em></li><li><strong>dYdX Chain (v4): block time:</strong> The official onboarding FAQ states an average block time of about 1 second, and that short-term order cancels are best effort until the block is final. Use `--b-window-ms 1000` to evaluate a 1-second batching cadence. <em>Source: https://docs.dydx.xyz/concepts/onboarding-faqs</em></li><li><strong>Not documented (stay parameterized assumptions):</strong> No venue documentation specifies MM reaction time, market-data feed latency, client-to-sequencer network transit, or latency-arbitrageur reaction time. Defaults (feed 5 ms, MM reaction 10 ms, sniper reaction 2 ms, network 30 ms) are parameterized assumptions; sweep `--mm-react` rather than trusting a single point. <em>Source: n/a</em></li></ul><h3 style="margin-top: 14px;">Dywe Protocol Design Parameters &amp; Threat Model</h3><ul><li><strong>Dywe micro-batch window &amp; threshold decryption RTT:</strong> The 50 ms micro-batch window and 35 ms / 70 ms threshold decryption RTTs are Dywe protocol design parameters, not live multi-region Devnet measurements.</li><li><strong>Unified post-decrypt threat model:</strong> All order messages (New ALO, Cancel, Taker) are threshold-encrypted client-side (BLS12-381) until batch_close. Threshold decryption completes in matching-engine memory at clear_ns = batch_close + decrypt_ms before the first fill executes, enabling deterministic New (ALO) -&gt; Cancel -&gt; Taker ordering (--d-batch-order hl) without leaking ALO/IOC flags pre-commit. The leak_ppm grid models potential residual side-channel/timing leakage on batches with MM cancels (0% under full cryptographic payload/metadata padding; 10%-50% stress sensitivity).</li><li><strong>Stylized model disclaimer:</strong> Regimes B (70 ms / 200 ms / 1000 ms) are stylized batching models, not byte-for-byte reproductions of Hyperliquid or dYdX matching engines.</li></ul></div>
 
     <div class="bounds-box">
         <h3>Methodological Scope &amp; Statistical Boundaries</h3>
         <ul>
-            <li><strong>Regime D timeline:</strong> orders arrive at <code>arr_ns</code> inside a batch window, commit at <code>batch_close</code>, complete threshold decryption at <code>clear_ns = batch_close + decrypt_ms</code>, and clear in matching-engine memory using <code>hl</code> ordering. Windows: B 70ms (hl), C 100ms, D 50ms (hl).</li>
+            <li><strong>Regime D timeline:</strong> all order fields (New ALO, Cancel, Taker) are threshold-encrypted pre-commit, commit at <code>batch_close</code>, complete threshold decryption at <code>clear_ns = batch_close + decrypt_ms</code>, and clear in matching-engine memory using <code>hl</code> ordering. Windows: B 70ms (hl), C 100ms, D 50ms (hl).</li>
+            <li><strong>Simulated latency-arb probe:</strong> StaleSnipe hits are generated by a deterministic parameterized probe (2 bps trigger, 2 ms reaction, $25000 clip; configurable via <code>--sniper-clip</code>).</li>
             <li><strong>Selection bias under drop:</strong> when <code>pending=drop</code>, takers arriving during an MM cancel-replace gap are excluded from both MM markout and All-In Net; compare <code>Dropped Takers (USD%)</code> before comparing costs across regimes.</li>
             <li><strong>Single-denominator additivity:</strong> <code>--wait-cohort all</code> (default) computes waiting drift over all executed takers (<code>tk_n</code>), matching the denominator of Spread Paid, Taker Stale, and MEV Taker.</li>
             <li><strong>95% bootstrap CI:</strong> joint 3-hour block resampling across BTCUSDT and ETHUSDT (24 blocks). It reflects drift variance under fixed scenario assumptions and does not cover parameter uncertainty (capture, impact, leak, reaction times, windows).</li>
-            <li><strong>Encryption scope:</strong> encryption enters only through the MEV/leakage grid and the decryption wait. Cancel headers stay plaintext for head-of-batch priority; the header-leak probability is a scenario parameter (10% in the tables above), not a measured value.</li>
-            <li><strong>Other limits:</strong> exogenous taker flow (does not react to spread), one representative MM clearing the whole flow, threshold-bound sniper behaviour, single 7-day sample.</li>
+            <li><strong>Other limits:</strong> exogenous taker flow (invariant to spread width), one representative MM clearing the entire exchange flow, absolute <code>s*net</code> levels not directly comparable to real Binance tick spreads, and limited sample windows.</li>
         </ul>
     </div>
 </div>
