@@ -1,0 +1,616 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dywe Protocol — Causal Microstructure &amp; Break-Even Ablation Report (v0.3.5)</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        :root {
+            --bg-primary: #060913;
+            --bg-card: #0d1323;
+            --bg-card-alt: #131c31;
+            --border-color: #1e293b;
+            --border-highlight: rgba(194, 138, 255, 0.35);
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --accent-purple: #c28aff;
+            --accent-blue: #38bdf8;
+            --accent-amber: #f59e0b;
+            --accent-red: #f43f5e;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background-color: var(--bg-primary);
+            background-image: radial-gradient(circle at 50% 0%, rgba(194, 138, 255, 0.06) 0%, transparent 55%);
+            color: var(--text-main);
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            line-height: 1.5;
+            padding: 28px 40px 44px 40px;
+        }
+        .container { max-width: 1520px; margin: 0 auto; }
+        .top-bar {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 18px; font-family: 'JetBrains Mono', monospace;
+            font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+        }
+        .brand-pill {
+            display: inline-flex; align-items: center; gap: 8px;
+            color: var(--accent-purple); background: rgba(194, 138, 255, 0.08);
+            border: 1px solid var(--border-highlight); padding: 5px 12px;
+            border-radius: 999px; font-weight: 600;
+        }
+        .brand-dot {
+            width: 7px; height: 7px; border-radius: 50%;
+            background: var(--accent-purple); box-shadow: 0 0 8px var(--accent-purple);
+        }
+        .engine-tag { color: var(--text-muted); }
+        header {
+            display: flex; justify-content: space-between; align-items: flex-end;
+            gap: 24px; border-bottom: 1px solid var(--border-color);
+            padding-bottom: 22px; margin-bottom: 24px;
+        }
+        .title-group h1 { font-size: 24px; font-weight: 700; letter-spacing: -0.02em; color: #ffffff; }
+        .title-group p { color: var(--text-muted); font-size: 13px; margin-top: 6px; }
+        .meta-badges { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+        .badge {
+            background: var(--bg-card-alt); border: 1px solid var(--border-color);
+            padding: 5px 11px; border-radius: 6px; font-size: 11px;
+            font-family: 'JetBrains Mono', monospace; color: #cbd5e1;
+        }
+        .badge strong { color: var(--accent-purple); font-weight: 600; }
+        .warn-banner {
+            background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.35);
+            color: #fde68a; padding: 12px 16px; border-radius: 8px; font-size: 12.5px;
+            margin-bottom: 22px;
+        }
+        .kpi-grid {
+            display: grid; grid-template-columns: repeat(4, 1fr);
+            gap: 18px; margin-bottom: 24px;
+        }
+        .kpi-card {
+            background: linear-gradient(180deg, rgba(19, 28, 49, 0.9) 0%, var(--bg-card) 100%);
+            border: 1px solid var(--border-color); border-top: 1px solid rgba(194, 138, 255, 0.25);
+            border-radius: 12px; padding: 18px 20px;
+        }
+        .kpi-card .label {
+            font-size: 10.5px; font-weight: 600; text-transform: uppercase;
+            letter-spacing: 0.06em; color: var(--text-muted);
+        }
+        .kpi-card .value {
+            font-size: 25px; font-weight: 700; color: var(--accent-purple);
+            margin: 8px 0; font-family: 'JetBrains Mono', monospace; letter-spacing: -0.02em;
+        }
+        .kpi-pill {
+            display: inline-block; font-size: 11px; font-family: 'JetBrains Mono', monospace;
+            color: #e2e8f0; background: rgba(56, 189, 248, 0.1);
+            border: 1px solid rgba(56, 189, 248, 0.25); padding: 3px 8px; border-radius: 5px;
+        }
+        .charts-row {
+            display: grid; grid-template-columns: repeat(2, 1fr);
+            gap: 20px; margin-bottom: 24px;
+        }
+        .chart-card, .table-card {
+            background: var(--bg-card); border: 1px solid var(--border-color);
+            border-radius: 12px; padding: 22px 24px; overflow-x: auto;
+        }
+        .chart-card h2, .table-card h2 { font-size: 15.5px; font-weight: 600; margin-bottom: 6px; color: #ffffff; }
+        .chart-card p { font-size: 12px; color: var(--text-muted); margin-bottom: 14px; }
+        .chart-wrapper { position: relative; height: 320px; width: 100%; }
+        table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+        th, td {
+            padding: 9px 9px; text-align: right; border-bottom: 1px solid var(--border-color);
+            font-family: 'JetBrains Mono', monospace; white-space: nowrap;
+        }
+        th:first-child, td:first-child { text-align: left; font-family: 'Inter', sans-serif; font-weight: 600; }
+        th {
+            color: var(--text-muted); font-size: 9.5px; text-transform: uppercase;
+            letter-spacing: 0.05em; background: var(--bg-card-alt);
+        }
+        tr.highlight-row { background: rgba(194, 138, 255, 0.08); }
+        tr.highlight-row td { color: var(--accent-purple); font-weight: 600; }
+        td.cell-win { color: #c28aff; background: rgba(194, 138, 255, 0.07); font-weight: 600; }
+        td.cell-loss { color: #fbbf24; background: rgba(245, 158, 11, 0.06); }
+        td.cell-neutral { color: #94a3b8; }
+        .bounds-box {
+            background: var(--bg-card); border: 1px solid var(--border-color);
+            border-left: 3px solid var(--accent-purple); border-radius: 10px;
+            padding: 18px 22px; margin: 22px 0; font-size: 12.5px; color: var(--text-muted);
+        }
+        .bounds-box h3 { color: #ffffff; font-size: 14px; margin-bottom: 8px; }
+        .bounds-box ul { padding-left: 18px; display: flex; flex-direction: column; gap: 5px; }
+        code { color: var(--accent-purple); background: var(--bg-card-alt); padding: 2px 5px; border-radius: 4px; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="top-bar">
+        <span class="brand-pill"><span class="brand-dot"></span>DYWE PROTOCOL // CAUSAL MICROSTRUCTURE RESEARCH (v0.3.5)</span>
+        <span class="engine-tag">B=hl &bull; D=hl &bull; D-EXP=all &bull; REQ=1.500bp &bull; PENDING=drop &bull; DETERMINISTIC i128</span>
+    </div>
+
+    <header>
+        <div class="title-group">
+            <h1>DYWE EXCHANGE &mdash; CAUSAL MICROSTRUCTURE &amp; BREAK-EVEN ABLATION STUDY</h1>
+            <p>Scenario-Based Counterfactual Replay on Binance Futures flow (BTCUSDT, ETHUSDT, SOLUSDT, 2024-03-28 + 3d | 24 Joint 3h Bootstrap Blocks | Rebate 0.500bp to MM, OpEx 0.300bp)</p>
+        </div>
+        <div class="meta-badges">
+            <span class="badge">Pair-Days: <strong>9/9</strong></span>
+            <span class="badge">Mid Ticks: <strong>3269988</strong></span>
+            <span class="badge">1-ms Bursts: <strong>4244321</strong></span>
+            <span class="badge">Requote Thr: <strong>1.500bp</strong></span>
+            <span class="badge">D Exposure: <strong>all</strong></span>
+            <span class="badge">Pending: <strong>drop</strong></span>
+            <span class="badge">Source: <strong>L1 BookTicker Mid</strong></span>
+        </div>
+    </header>
+
+    <div class="warn-banner">Historical taker flow diagnostics (pure exchange volume $62,931,377,194, threshold &gt;=$50,000): unmerged raw rows = 8615487 (244685 large rows, 47.9% of USD volume); 1-ms directional bursts (`merge_taker`) = 4244321 (237805 large bursts, 68.2% of USD volume).<br>Native L1 bookTicker diagnostics (9 files): 74023564 raw quote rows -&gt; 3269988 distinct ms-level mid changes (4312026 same-ms collapsed, 66441550 unchanged-mid skipped); inter-update interval median = 3 ms, mean = 237.79 ms.</div>
+
+    <div class="kpi-grid">
+        <div class="kpi-card">
+            <div class="label">Net Half-Spread s* (MEV=0), Regime D (35ms decrypt)</div>
+            <div class="value">0.582 bps</div>
+            <span class="kpi-pill">vs 1.112 bps (FIFO) &amp; 0.467 bps (Regime B 70ms)</span>
+        </div>
+        <div class="kpi-card">
+            <div class="label">1s MM Markout (MEV=0), Regime D</div>
+            <div class="value">-0.782 bps</div>
+            <span class="kpi-pill">vs -1.312 bps (FIFO); see cohort table</span>
+        </div>
+        <div class="kpi-card">
+            <div class="label">35ms Decrypt Taker Delta vs Regime B (Zero-MEV)</div>
+            <div class="value">+0.005 bps</div>
+            <span class="kpi-pill">All-In Taker Cost delta (wait=all)</span>
+        </div>
+        <div class="kpi-card">
+            <div class="label">Scenario &Delta; All-In (25% cap, 1bp, 10% leak, exp=all)</div>
+            <div class="value">-0.096 bps</div>
+            <span class="kpi-pill">Scenario output &mdash; not a measurement</span>
+        </div>
+    </div>
+
+    <div class="charts-row">
+        <div class="chart-card">
+            <h2>Chart 1A: BTCUSDT Signed MM Markout Trajectory (bps)</h2>
+            <p>Volume-weighted post-trade MM markout across 0 ms &rarr; 1000 ms (MEV = 0 pure mechanics)</p>
+            <div class="chart-wrapper"><canvas id="chartSym1"></canvas></div>
+        </div>
+        <div class="chart-card">
+            <h2>Chart 1B: ETHUSDT Signed MM Markout Trajectory (bps)</h2>
+            <p>Volume-weighted post-trade MM markout across 0 ms &rarr; 1000 ms (MEV = 0 pure mechanics)</p>
+            <div class="chart-wrapper"><canvas id="chartSym2"></canvas></div>
+        </div>
+    </div>
+
+    <div class="table-card" style="margin-bottom: 24px;">
+        <h2>Consolidated Multi-Pair Benchmark &mdash; Pure Latency &amp; Sequencing Mechanics (MEV = 0)</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Architecture Regime</th>
+                    <th>MM Vol (incl. Probe)</th>
+                    <th>Hist Taker Vol</th>
+                    <th>Markout 0ms</th>
+                    <th>Markout 100ms</th>
+                    <th>Markout 1s</th>
+                    <th>s* Gross</th>
+                    <th>s* Net</th>
+                    <th>[1] Spread Paid</th>
+                    <th>[2] Taker Stale</th>
+                    <th>[3] Wait (All)</th>
+                    <th>[=] All-In Net</th>
+                    <th>StaleSnipe Hit/Miss</th>
+                    <th>Dropped Takers (USD%)</th>
+                    <th>Batches</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr><td>A: Continuous FIFO, react 10ms</td><td>$64,114,205,852</td><td>$62,928,280,852</td><td>-1.085</td><td>-1.255</td><td>-1.312</td><td>1.312</td><td>1.112</td><td>1.112</td><td>-1.068</td><td>0.626</td><td><strong>0.670</strong></td><td>35107/48</td><td>216 (0.004%)</td><td>0</td></tr>
+<tr><td>B: Batch 70ms (hl), react 10ms</td><td>$64,257,499,954</td><td>$62,914,699,954</td><td>-0.515</td><td>-0.639</td><td>-0.667</td><td>0.667</td><td>0.467</td><td>0.467</td><td>-0.517</td><td>0.701</td><td><strong>0.651</strong></td><td>3357/26</td><td>322 (0.026%)</td><td>2967734</td></tr>
+<tr><td>C: Uniform-Price FBA 100ms, react 10ms</td><td>$59,461,631,504</td><td>$62,922,700,398</td><td>-0.475</td><td>-0.588</td><td>-0.622</td><td>0.622</td><td>0.422</td><td>0.390</td><td>-0.441</td><td>0.722</td><td><strong>0.671</strong></td><td>2180/22</td><td>269 (0.013%)</td><td>2769229</td></tr>
+<tr><td>D: Dywe IBTE 50ms (dec 0ms, hl), react 10ms</td><td>$64,213,671,566</td><td>$62,908,246,566</td><td>-0.605</td><td>-0.735</td><td>-0.778</td><td>0.778</td><td>0.578</td><td>0.578</td><td>-0.609</td><td>0.683</td><td><strong>0.653</strong></td><td>4605/45</td><td>572 (0.036%)</td><td>3137395</td></tr>
+<tr class="highlight-row"><td>D: Dywe IBTE 50ms (dec 35ms, hl), react 10ms</td><td>$64,356,421,566</td><td>$62,908,246,566</td><td>-0.669</td><td>-0.756</td><td>-0.782</td><td>0.782</td><td>0.582</td><td>0.582</td><td>-0.674</td><td>0.748</td><td><strong>0.656</strong></td><td>4517/46</td><td>572 (0.036%)</td><td>3138308</td></tr>
+<tr><td>D: Dywe IBTE 50ms (dec 70ms, hl), react 10ms</td><td>$64,447,471,566</td><td>$62,908,246,566</td><td>-0.713</td><td>-0.765</td><td>-0.785</td><td>0.785</td><td>0.585</td><td>0.585</td><td>-0.718</td><td>0.792</td><td><strong>0.659</strong></td><td>4444/48</td><td>572 (0.036%)</td><td>3138657</td></tr>
+
+            </tbody>
+        </table>
+        <p style="margin-top: 10px; font-size: 11.5px; color: var(--text-muted);">
+            <strong>Identity (MEV = 0):</strong> <code>[1] Spread Paid + [2] Taker Stale + [3] Wait = All-In Net</code> (wait cohort: <code>all</code>; requote_thr: <code>1.500bp</code>, sniper_thr: <code>2.000bp</code>).
+            <strong>Adverse selection check (Regime A, 1s markout):</strong> -1.312 bps, 95% CI [-1.425, -1.216]. Expected negative sign confirmed.
+        </p>
+    </div>
+
+    <div class="bounds-box"><h3>Placebo test: circularly shifted taker flow</h3><ul><li>Real flow (react 10ms): A -1.312 bp, B -0.667 bp, cancel-priority gap (B minus A) 0.645 bp.</li><li>Placebo shift 600 s: A -0.036 bp, B -0.009 bp, gap 0.027 bp = 4.2% of the real gap.</li><li>Placebo shift 3600 s: A -0.045 bp, B -0.017 bp, gap 0.027 bp = 4.2% of the real gap.</li><li><strong>Reading:</strong> circular shifting tests whether markout stems from temporal alignment between flow and subsequent price moves rather than static drift; it does not test midpoint reconstruction accuracy.</li></ul></div><div class="table-card" style="margin-bottom: 22px;">
+                <h2>Placebo: takers shifted 600s (consolidated, MEV = 0)</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Architecture Regime</th>
+                            <th>MM Vol (incl. Probe)</th>
+                            <th>Hist Taker Vol</th>
+                            <th>Markout 0ms</th>
+                            <th>Markout 100ms</th>
+                            <th>Markout 1s</th>
+                            <th>s* Gross</th>
+                            <th>s* Net</th>
+                            <th>[1] Spread Paid</th>
+                            <th>[2] Taker Stale</th>
+                            <th>[3] Wait (All)</th>
+                            <th>[=] All-In Net</th>
+                            <th>StaleSnipe Hit/Miss</th>
+                            <th>Dropped Takers (USD%)</th>
+                            <th>Batches</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>A: Continuous FIFO, react 10ms, PLACEBO shift 600s</td><td>$64,115,841,447</td><td>$62,929,916,447</td><td>-0.032</td><td>-0.033</td><td>-0.036</td><td>0.036</td><td>&lt;0</td><td>0.000</td><td>0.004</td><td>0.000</td><td><strong>0.003</strong></td><td>35107/48</td><td>54 (0.002%)</td><td>0</td></tr>
+<tr><td>B: Batch 70ms (hl), react 10ms, PLACEBO shift 600s</td><td>$64,273,998,390</td><td>$62,931,198,390</td><td>-0.004</td><td>-0.006</td><td>-0.009</td><td>0.009</td><td>&lt;0</td><td>0.000</td><td>0.003</td><td>0.000</td><td><strong>0.003</strong></td><td>3357/26</td><td>37 (0.000%)</td><td>3054805</td></tr>
+<tr><td>C: Uniform-Price FBA 100ms, react 10ms, PLACEBO shift 600s</td><td>$59,393,267,067</td><td>$62,931,111,397</td><td>-0.004</td><td>-0.005</td><td>-0.009</td><td>0.009</td><td>&lt;0</td><td>0.000</td><td>0.003</td><td>0.000</td><td><strong>0.003</strong></td><td>2180/22</td><td>37 (0.000%)</td><td>2847541</td></tr>
+<tr><td>D: Dywe IBTE 50ms (dec 0ms, hl), react 10ms, PLACEBO shift 600s</td><td>$64,236,459,799</td><td>$62,931,034,799</td><td>-0.005</td><td>-0.006</td><td>-0.010</td><td>0.010</td><td>&lt;0</td><td>0.000</td><td>0.002</td><td>0.000</td><td><strong>0.003</strong></td><td>4605/45</td><td>44 (0.000%)</td><td>3227245</td></tr>
+<tr class="highlight-row"><td>D: Dywe IBTE 50ms (dec 35ms, hl), react 10ms, PLACEBO shift 600s</td><td>$64,379,209,799</td><td>$62,931,034,799</td><td>-0.007</td><td>-0.009</td><td>-0.012</td><td>0.012</td><td>&lt;0</td><td>0.000</td><td>0.003</td><td>0.000</td><td><strong>0.003</strong></td><td>4517/46</td><td>44 (0.000%)</td><td>3232151</td></tr>
+<tr><td>D: Dywe IBTE 50ms (dec 70ms, hl), react 10ms, PLACEBO shift 600s</td><td>$64,470,259,799</td><td>$62,931,034,799</td><td>-0.009</td><td>-0.010</td><td>-0.015</td><td>0.015</td><td>&lt;0</td><td>0.000</td><td>0.003</td><td>0.000</td><td><strong>0.003</strong></td><td>4444/48</td><td>44 (0.000%)</td><td>3235304</td></tr>
+
+                    </tbody>
+                </table>
+            </div><div class="table-card" style="margin-bottom: 22px;">
+                <h2>Placebo: takers shifted 3600s (consolidated, MEV = 0)</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Architecture Regime</th>
+                            <th>MM Vol (incl. Probe)</th>
+                            <th>Hist Taker Vol</th>
+                            <th>Markout 0ms</th>
+                            <th>Markout 100ms</th>
+                            <th>Markout 1s</th>
+                            <th>s* Gross</th>
+                            <th>s* Net</th>
+                            <th>[1] Spread Paid</th>
+                            <th>[2] Taker Stale</th>
+                            <th>[3] Wait (All)</th>
+                            <th>[=] All-In Net</th>
+                            <th>StaleSnipe Hit/Miss</th>
+                            <th>Dropped Takers (USD%)</th>
+                            <th>Batches</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>A: Continuous FIFO, react 10ms, PLACEBO shift 3600s</td><td>$64,115,555,787</td><td>$62,929,630,787</td><td>-0.037</td><td>-0.038</td><td>-0.045</td><td>0.045</td><td>&lt;0</td><td>0.000</td><td>-0.001</td><td>0.000</td><td><strong>-0.002</strong></td><td>35107/48</td><td>44 (0.002%)</td><td>0</td></tr>
+<tr><td>B: Batch 70ms (hl), react 10ms, PLACEBO shift 3600s</td><td>$64,273,946,309</td><td>$62,931,146,309</td><td>-0.009</td><td>-0.010</td><td>-0.017</td><td>0.017</td><td>&lt;0</td><td>0.000</td><td>-0.001</td><td>-0.001</td><td><strong>-0.003</strong></td><td>3357/26</td><td>32 (0.000%)</td><td>3057539</td></tr>
+<tr><td>C: Uniform-Price FBA 100ms, react 10ms, PLACEBO shift 3600s</td><td>$59,409,961,292</td><td>$62,931,168,286</td><td>-0.009</td><td>-0.010</td><td>-0.019</td><td>0.019</td><td>&lt;0</td><td>0.000</td><td>-0.001</td><td>-0.001</td><td><strong>-0.002</strong></td><td>2180/22</td><td>42 (0.000%)</td><td>2849912</td></tr>
+<tr><td>D: Dywe IBTE 50ms (dec 0ms, hl), react 10ms, PLACEBO shift 3600s</td><td>$64,236,634,154</td><td>$62,931,209,154</td><td>-0.010</td><td>-0.011</td><td>-0.018</td><td>0.018</td><td>&lt;0</td><td>0.000</td><td>-0.002</td><td>0.000</td><td><strong>-0.003</strong></td><td>4605/45</td><td>41 (0.000%)</td><td>3229244</td></tr>
+<tr class="highlight-row"><td>D: Dywe IBTE 50ms (dec 35ms, hl), react 10ms, PLACEBO shift 3600s</td><td>$64,379,384,154</td><td>$62,931,209,154</td><td>-0.012</td><td>-0.014</td><td>-0.021</td><td>0.021</td><td>&lt;0</td><td>0.000</td><td>-0.001</td><td>-0.001</td><td><strong>-0.003</strong></td><td>4517/46</td><td>41 (0.000%)</td><td>3234124</td></tr>
+<tr><td>D: Dywe IBTE 50ms (dec 70ms, hl), react 10ms, PLACEBO shift 3600s</td><td>$64,470,434,154</td><td>$62,931,209,154</td><td>-0.013</td><td>-0.015</td><td>-0.023</td><td>0.023</td><td>&lt;0</td><td>0.000</td><td>0.000</td><td>-0.002</td><td><strong>-0.003</strong></td><td>4444/48</td><td>41 (0.000%)</td><td>3237435</td></tr>
+
+                    </tbody>
+                </table>
+            </div>
+
+    <div class="bounds-box"><h3>Cancel-priority gap versus reaction handicap / window</h3><ul><li>react 10ms: handicap (MM minus sniper reaction) 8ms, B window 70ms, handicap/window 11%, gap 0.645 bp = 49.1% of A's 1s markout magnitude.</li></ul></div>
+
+    <div class="table-card" style="margin-bottom: 24px;">
+        <h2>Consolidated MM Flow Cohort Decomposition &amp; Volume Reconciliation</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Architecture Regime</th>
+                    <th>Taker Vol</th>
+                    <th>StaleSnipe Vol</th>
+                    <th>LateSnipe Vol</th>
+                    <th>Total MM Vol</th>
+                    <th>Vol Diff</th>
+                    <th>Taker 1s Markout</th>
+                    <th>StaleSnipe 1s Markout</th>
+                    <th>LateSnipe 1s Markout</th>
+                    <th>1-ms Burst Vol % (&ge;$50,000)</th>
+                    <th>Cancel-Batch Large %</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr><td>A: Continuous FIFO, react 10ms</td><td>$62,928,280,852</td><td>$877,675,000</td><td>$308,250,000</td><td>$64,114,205,852</td><td>$0</td><td>-1.297</td><td>-2.564</td><td>-0.887</td><td>68.2%</td><td>0.0%</td></tr>
+<tr><td>B: Batch 70ms (hl), react 10ms</td><td>$62,914,699,954</td><td>$83,925,000</td><td>$1,258,875,000</td><td>$64,257,499,954</td><td>$0</td><td>-0.670</td><td>-2.548</td><td>-0.420</td><td>68.2%</td><td>31.2%</td></tr>
+<tr><td>C: Uniform-Price FBA 100ms, react 10ms</td><td>$59,461,631,504</td><td>$0</td><td>$0</td><td>$59,461,631,504</td><td>$0</td><td>-0.622</td><td>n/a</td><td>n/a</td><td>68.2%</td><td>0.0%</td></tr>
+<tr><td>D: Dywe IBTE 50ms (dec 0ms, hl), react 10ms</td><td>$62,908,246,566</td><td>$115,125,000</td><td>$1,190,300,000</td><td>$64,213,671,566</td><td>$0</td><td>-0.782</td><td>-2.587</td><td>-0.404</td><td>68.2%</td><td>26.7%</td></tr>
+<tr class="highlight-row"><td>D: Dywe IBTE 50ms (dec 35ms, hl), react 10ms</td><td>$62,908,246,566</td><td>$112,925,000</td><td>$1,335,250,000</td><td>$64,356,421,566</td><td>$0</td><td>-0.785</td><td>-2.588</td><td>-0.483</td><td>68.2%</td><td>26.7%</td></tr>
+<tr><td>D: Dywe IBTE 50ms (dec 70ms, hl), react 10ms</td><td>$62,908,246,566</td><td>$111,100,000</td><td>$1,428,125,000</td><td>$64,447,471,566</td><td>$0</td><td>-0.788</td><td>-2.590</td><td>-0.531</td><td>68.2%</td><td>26.7%</td></tr>
+
+            </tbody>
+        </table>
+    </div>
+
+    <div class="table-card" style="margin-bottom: 22px;">
+                <h2>BTCUSDT — Pure Microstructure Mechanics (MEV = 0)</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Architecture Regime</th>
+                            <th>MM Vol (incl. Probe)</th>
+                            <th>Hist Taker Vol</th>
+                            <th>Markout 0ms</th>
+                            <th>Markout 100ms</th>
+                            <th>Markout 1s</th>
+                            <th>s* Gross</th>
+                            <th>s* Net</th>
+                            <th>[1] Spread Paid</th>
+                            <th>[2] Taker Stale</th>
+                            <th>[3] Wait (All)</th>
+                            <th>[=] All-In Net</th>
+                            <th>StaleSnipe Hit/Miss</th>
+                            <th>Dropped Takers (USD%)</th>
+                            <th>Batches</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>A: Continuous FIFO, react 10ms</td><td>$36,790,884,363</td><td>$36,630,409,363</td><td>-0.871</td><td>-1.041</td><td>-1.115</td><td>1.115</td><td>0.915</td><td>0.915</td><td>-0.867</td><td>0.533</td><td><strong>0.581</strong></td><td>4246/7</td><td>49 (0.003%)</td><td>0</td></tr>
+<tr><td>B: Batch 70ms (hl), react 10ms</td><td>$36,820,561,211</td><td>$36,625,786,211</td><td>-0.501</td><td>-0.613</td><td>-0.660</td><td>0.660</td><td>0.460</td><td>0.460</td><td>-0.501</td><td>0.619</td><td><strong>0.578</strong></td><td>421/2</td><td>57 (0.016%)</td><td>1158839</td></tr>
+<tr><td>C: Uniform-Price FBA 100ms, react 10ms</td><td>$33,995,816,314</td><td>$36,628,216,864</td><td>-0.453</td><td>-0.560</td><td>-0.612</td><td>0.612</td><td>0.412</td><td>0.380</td><td>-0.418</td><td>0.635</td><td><strong>0.597</strong></td><td>266/3</td><td>73 (0.009%)</td><td>1076005</td></tr>
+<tr><td>D: Dywe IBTE 50ms (dec 0ms, hl), react 10ms</td><td>$36,805,037,617</td><td>$36,618,762,617</td><td>-0.537</td><td>-0.661</td><td>-0.717</td><td>0.717</td><td>0.517</td><td>0.517</td><td>-0.537</td><td>0.599</td><td><strong>0.579</strong></td><td>571/7</td><td>193 (0.035%)</td><td>1228382</td></tr>
+<tr class="highlight-row"><td>D: Dywe IBTE 50ms (dec 35ms, hl), react 10ms</td><td>$36,835,312,617</td><td>$36,618,762,617</td><td>-0.598</td><td>-0.679</td><td>-0.722</td><td>0.722</td><td>0.522</td><td>0.522</td><td>-0.598</td><td>0.660</td><td><strong>0.583</strong></td><td>561/7</td><td>193 (0.035%)</td><td>1228480</td></tr>
+<tr><td>D: Dywe IBTE 50ms (dec 70ms, hl), react 10ms</td><td>$36,854,362,617</td><td>$36,618,762,617</td><td>-0.637</td><td>-0.696</td><td>-0.725</td><td>0.725</td><td>0.525</td><td>0.525</td><td>-0.637</td><td>0.699</td><td><strong>0.587</strong></td><td>553/7</td><td>193 (0.035%)</td><td>1228514</td></tr>
+
+                    </tbody>
+                </table>
+            </div><div class="table-card" style="margin-bottom: 22px;">
+                <h2>ETHUSDT — Pure Microstructure Mechanics (MEV = 0)</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Architecture Regime</th>
+                            <th>MM Vol (incl. Probe)</th>
+                            <th>Hist Taker Vol</th>
+                            <th>Markout 0ms</th>
+                            <th>Markout 100ms</th>
+                            <th>Markout 1s</th>
+                            <th>s* Gross</th>
+                            <th>s* Net</th>
+                            <th>[1] Spread Paid</th>
+                            <th>[2] Taker Stale</th>
+                            <th>[3] Wait (All)</th>
+                            <th>[=] All-In Net</th>
+                            <th>StaleSnipe Hit/Miss</th>
+                            <th>Dropped Takers (USD%)</th>
+                            <th>Batches</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>A: Continuous FIFO, react 10ms</td><td>$17,821,358,950</td><td>$17,568,333,950</td><td>-1.129</td><td>-1.321</td><td>-1.395</td><td>1.395</td><td>1.195</td><td>1.195</td><td>-1.118</td><td>0.709</td><td><strong>0.786</strong></td><td>7063/17</td><td>59 (0.005%)</td><td>0</td></tr>
+<tr><td>B: Batch 70ms (hl), react 10ms</td><td>$17,859,555,936</td><td>$17,561,330,936</td><td>-0.529</td><td>-0.663</td><td>-0.710</td><td>0.710</td><td>0.510</td><td>0.510</td><td>-0.530</td><td>0.788</td><td><strong>0.768</strong></td><td>749/6</td><td>141 (0.045%)</td><td>975655</td></tr>
+<tr><td>C: Uniform-Price FBA 100ms, react 10ms</td><td>$16,646,057,427</td><td>$17,567,057,419</td><td>-0.479</td><td>-0.603</td><td>-0.654</td><td>0.654</td><td>0.454</td><td>0.422</td><td>-0.446</td><td>0.811</td><td><strong>0.787</strong></td><td>446/4</td><td>40 (0.012%)</td><td>915483</td></tr>
+<tr><td>D: Dywe IBTE 50ms (dec 0ms, hl), react 10ms</td><td>$17,848,506,814</td><td>$17,561,906,814</td><td>-0.644</td><td>-0.793</td><td>-0.855</td><td>0.855</td><td>0.655</td><td>0.655</td><td>-0.646</td><td>0.765</td><td><strong>0.774</strong></td><td>993/11</td><td>147 (0.042%)</td><td>1026988</td></tr>
+<tr class="highlight-row"><td>D: Dywe IBTE 50ms (dec 35ms, hl), react 10ms</td><td>$17,887,581,814</td><td>$17,561,906,814</td><td>-0.722</td><td>-0.809</td><td>-0.855</td><td>0.855</td><td>0.655</td><td>0.655</td><td>-0.725</td><td>0.844</td><td><strong>0.773</strong></td><td>978/12</td><td>147 (0.042%)</td><td>1027109</td></tr>
+<tr><td>D: Dywe IBTE 50ms (dec 70ms, hl), react 10ms</td><td>$17,911,931,814</td><td>$17,561,906,814</td><td>-0.768</td><td>-0.820</td><td>-0.852</td><td>0.852</td><td>0.652</td><td>0.652</td><td>-0.772</td><td>0.890</td><td><strong>0.771</strong></td><td>969/11</td><td>147 (0.042%)</td><td>1027161</td></tr>
+
+                    </tbody>
+                </table>
+            </div><div class="table-card" style="margin-bottom: 22px;">
+                <h2>SOLUSDT — Pure Microstructure Mechanics (MEV = 0)</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Architecture Regime</th>
+                            <th>MM Vol (incl. Probe)</th>
+                            <th>Hist Taker Vol</th>
+                            <th>Markout 0ms</th>
+                            <th>Markout 100ms</th>
+                            <th>Markout 1s</th>
+                            <th>s* Gross</th>
+                            <th>s* Net</th>
+                            <th>[1] Spread Paid</th>
+                            <th>[2] Taker Stale</th>
+                            <th>[3] Wait (All)</th>
+                            <th>[=] All-In Net</th>
+                            <th>StaleSnipe Hit/Miss</th>
+                            <th>Dropped Takers (USD%)</th>
+                            <th>Batches</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>A: Continuous FIFO, react 10ms</td><td>$9,501,962,539</td><td>$8,729,537,539</td><td>-1.829</td><td>-1.961</td><td>-1.923</td><td>1.923</td><td>1.723</td><td>1.723</td><td>-1.814</td><td>0.846</td><td><strong>0.755</strong></td><td>23798/24</td><td>108 (0.007%)</td><td>0</td></tr>
+<tr><td>B: Batch 70ms (hl), react 10ms</td><td>$9,577,382,807</td><td>$8,727,582,807</td><td>-0.538</td><td>-0.693</td><td>-0.615</td><td>0.615</td><td>0.415</td><td>0.415</td><td>-0.558</td><td>0.872</td><td><strong>0.729</strong></td><td>2187/18</td><td>124 (0.030%)</td><td>833240</td></tr>
+<tr><td>C: Uniform-Price FBA 100ms, react 10ms</td><td>$8,819,757,763</td><td>$8,727,426,115</td><td>-0.550</td><td>-0.670</td><td>-0.604</td><td>0.604</td><td>0.404</td><td>0.368</td><td>-0.525</td><td>0.907</td><td><strong>0.751</strong></td><td>1468/15</td><td>156 (0.031%)</td><td>777741</td></tr>
+<tr><td>D: Dywe IBTE 50ms (dec 0ms, hl), react 10ms</td><td>$9,560,127,135</td><td>$8,727,577,135</td><td>-0.794</td><td>-0.908</td><td>-0.871</td><td>0.871</td><td>0.671</td><td>0.671</td><td>-0.835</td><td>0.871</td><td><strong>0.707</strong></td><td>3041/27</td><td>232 (0.030%)</td><td>882025</td></tr>
+<tr class="highlight-row"><td>D: Dywe IBTE 50ms (dec 35ms, hl), react 10ms</td><td>$9,633,527,135</td><td>$8,727,577,135</td><td>-0.847</td><td>-0.949</td><td>-0.879</td><td>0.879</td><td>0.679</td><td>0.679</td><td>-0.890</td><td>0.926</td><td><strong>0.715</strong></td><td>2978/27</td><td>232 (0.030%)</td><td>882719</td></tr>
+<tr><td>D: Dywe IBTE 50ms (dec 70ms, hl), react 10ms</td><td>$9,681,177,135</td><td>$8,727,577,135</td><td>-0.902</td><td>-0.925</td><td>-0.889</td><td>0.889</td><td>0.689</td><td>0.689</td><td>-0.948</td><td>0.984</td><td><strong>0.726</strong></td><td>2922/30</td><td>232 (0.030%)</td><td>882982</td></tr>
+
+                    </tbody>
+                </table>
+            </div>
+
+    <h2 style="font-size: 18px; margin: 26px 0 12px 0; color: #ffffff;">Phase 2: Break-Even Frontier &amp; Break-Even Leakage Across MEV Scenarios</h2>
+    <div class="table-card" style="margin-bottom: 20px;">
+                <h2>Break-Even Frontier: All-In(D) &minus; All-In(B) (bps) &mdash; Decrypt 0ms | React 10ms</h2>
+                
+                <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
+                    Assumptions: MM MEV Share = 50%, Leak = 10% (<code>eff_leak = min(leak, capture)</code>), D Exposure = <code>all</code>, Rebate = 0.500 bp (paid to MM), OpEx = 0.300 bp, Burst Threshold = $50,000, B/D Order = <code>hl/hl</code>, Pending = <code>drop</code>, Source = <code>book</code>, Wait = <code>all</code>.<br>
+                    <strong>D&lt;B</strong> (purple): Dywe cheaper (95% CI &lt; 0); <strong>B&lt;D</strong> (amber): Regime B cheaper; <strong>~</strong>: indistinguishable.
+                    <strong>Every cell with capture &gt; 0% is a parameterized scenario output, not a measurement.</strong>
+                </p>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Capture Rate \ Impact</th>
+                            <th>0.000 bps</th>
+                            <th>0.500 bps</th>
+                            <th>1.000 bps</th>
+                            <th>2.000 bps</th>
+                            <th>3.000 bps</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td><strong>0%</strong></td><td class="cell-neutral">0.001 ~</td><td class="cell-neutral">0.001 ~</td><td class="cell-neutral">0.001 ~</td><td class="cell-neutral">0.001 ~</td><td class="cell-neutral">0.001 ~</td></tr>
+<tr><td><strong>10%</strong></td><td class="cell-neutral">0.001 ~</td><td class="cell-neutral">0.001 ~</td><td class="cell-neutral">0.001 ~</td><td class="cell-neutral">0.001 ~</td><td class="cell-neutral">0.001 ~</td></tr>
+<tr><td><strong>25%</strong></td><td class="cell-neutral">0.001 ~</td><td class="cell-win">-0.049 D&lt;B</td><td class="cell-win">-0.099 D&lt;B</td><td class="cell-win">-0.201 D&lt;B</td><td class="cell-win">-0.302 D&lt;B</td></tr>
+<tr><td><strong>50%</strong></td><td class="cell-neutral">0.001 ~</td><td class="cell-win">-0.133 D&lt;B</td><td class="cell-win">-0.268 D&lt;B</td><td class="cell-win">-0.538 D&lt;B</td><td class="cell-win">-0.808 D&lt;B</td></tr>
+<tr><td><strong>75%</strong></td><td class="cell-neutral">0.001 ~</td><td class="cell-win">-0.218 D&lt;B</td><td class="cell-win">-0.437 D&lt;B</td><td class="cell-win">-0.876 D&lt;B</td><td class="cell-win">-1.315 D&lt;B</td></tr>
+<tr><td><strong>100%</strong></td><td class="cell-neutral">0.001 ~</td><td class="cell-win">-0.302 D&lt;B</td><td class="cell-win">-0.606 D&lt;B</td><td class="cell-win">-1.214 D&lt;B</td><td class="cell-win">-1.821 D&lt;B</td></tr>
+
+                    </tbody>
+                </table>
+            </div><div class="table-card" style="margin-bottom: 20px;">
+                <h2>Break-Even Frontier: All-In(D) &minus; All-In(B) (bps) &mdash; Decrypt 35ms | React 10ms</h2>
+                
+                <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
+                    Assumptions: MM MEV Share = 50%, Leak = 10% (<code>eff_leak = min(leak, capture)</code>), D Exposure = <code>all</code>, Rebate = 0.500 bp (paid to MM), OpEx = 0.300 bp, Burst Threshold = $50,000, B/D Order = <code>hl/hl</code>, Pending = <code>drop</code>, Source = <code>book</code>, Wait = <code>all</code>.<br>
+                    <strong>D&lt;B</strong> (purple): Dywe cheaper (95% CI &lt; 0); <strong>B&lt;D</strong> (amber): Regime B cheaper; <strong>~</strong>: indistinguishable.
+                    <strong>Every cell with capture &gt; 0% is a parameterized scenario output, not a measurement.</strong>
+                </p>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Capture Rate \ Impact</th>
+                            <th>0.000 bps</th>
+                            <th>0.500 bps</th>
+                            <th>1.000 bps</th>
+                            <th>2.000 bps</th>
+                            <th>3.000 bps</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td><strong>0%</strong></td><td class="cell-loss">0.005 B&lt;D</td><td class="cell-loss">0.005 B&lt;D</td><td class="cell-loss">0.005 B&lt;D</td><td class="cell-loss">0.005 B&lt;D</td><td class="cell-loss">0.005 B&lt;D</td></tr>
+<tr><td><strong>10%</strong></td><td class="cell-loss">0.005 B&lt;D</td><td class="cell-loss">0.005 B&lt;D</td><td class="cell-loss">0.005 B&lt;D</td><td class="cell-loss">0.005 B&lt;D</td><td class="cell-loss">0.004 B&lt;D</td></tr>
+<tr><td><strong>25%</strong></td><td class="cell-loss">0.005 B&lt;D</td><td class="cell-win">-0.045 D&lt;B</td><td class="cell-win">-0.096 D&lt;B</td><td class="cell-win">-0.197 D&lt;B</td><td class="cell-win">-0.298 D&lt;B</td></tr>
+<tr><td><strong>50%</strong></td><td class="cell-loss">0.005 B&lt;D</td><td class="cell-win">-0.129 D&lt;B</td><td class="cell-win">-0.265 D&lt;B</td><td class="cell-win">-0.535 D&lt;B</td><td class="cell-win">-0.805 D&lt;B</td></tr>
+<tr><td><strong>75%</strong></td><td class="cell-loss">0.005 B&lt;D</td><td class="cell-win">-0.214 D&lt;B</td><td class="cell-win">-0.433 D&lt;B</td><td class="cell-win">-0.872 D&lt;B</td><td class="cell-win">-1.311 D&lt;B</td></tr>
+<tr><td><strong>100%</strong></td><td class="cell-loss">0.005 B&lt;D</td><td class="cell-win">-0.298 D&lt;B</td><td class="cell-win">-0.602 D&lt;B</td><td class="cell-win">-1.210 D&lt;B</td><td class="cell-win">-1.818 D&lt;B</td></tr>
+
+                    </tbody>
+                </table>
+            </div><div class="table-card" style="margin-bottom: 20px;">
+                <h2>Break-Even Frontier: All-In(D) &minus; All-In(B) (bps) &mdash; Decrypt 70ms | React 10ms</h2>
+                
+                <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
+                    Assumptions: MM MEV Share = 50%, Leak = 10% (<code>eff_leak = min(leak, capture)</code>), D Exposure = <code>all</code>, Rebate = 0.500 bp (paid to MM), OpEx = 0.300 bp, Burst Threshold = $50,000, B/D Order = <code>hl/hl</code>, Pending = <code>drop</code>, Source = <code>book</code>, Wait = <code>all</code>.<br>
+                    <strong>D&lt;B</strong> (purple): Dywe cheaper (95% CI &lt; 0); <strong>B&lt;D</strong> (amber): Regime B cheaper; <strong>~</strong>: indistinguishable.
+                    <strong>Every cell with capture &gt; 0% is a parameterized scenario output, not a measurement.</strong>
+                </p>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Capture Rate \ Impact</th>
+                            <th>0.000 bps</th>
+                            <th>0.500 bps</th>
+                            <th>1.000 bps</th>
+                            <th>2.000 bps</th>
+                            <th>3.000 bps</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td><strong>0%</strong></td><td class="cell-loss">0.008 B&lt;D</td><td class="cell-loss">0.008 B&lt;D</td><td class="cell-loss">0.008 B&lt;D</td><td class="cell-loss">0.008 B&lt;D</td><td class="cell-loss">0.008 B&lt;D</td></tr>
+<tr><td><strong>10%</strong></td><td class="cell-loss">0.008 B&lt;D</td><td class="cell-loss">0.008 B&lt;D</td><td class="cell-loss">0.008 B&lt;D</td><td class="cell-loss">0.007 B&lt;D</td><td class="cell-loss">0.007 B&lt;D</td></tr>
+<tr><td><strong>25%</strong></td><td class="cell-loss">0.008 B&lt;D</td><td class="cell-win">-0.042 D&lt;B</td><td class="cell-win">-0.093 D&lt;B</td><td class="cell-win">-0.194 D&lt;B</td><td class="cell-win">-0.296 D&lt;B</td></tr>
+<tr><td><strong>50%</strong></td><td class="cell-loss">0.008 B&lt;D</td><td class="cell-win">-0.126 D&lt;B</td><td class="cell-win">-0.262 D&lt;B</td><td class="cell-win">-0.532 D&lt;B</td><td class="cell-win">-0.802 D&lt;B</td></tr>
+<tr><td><strong>75%</strong></td><td class="cell-loss">0.008 B&lt;D</td><td class="cell-win">-0.211 D&lt;B</td><td class="cell-win">-0.430 D&lt;B</td><td class="cell-win">-0.869 D&lt;B</td><td class="cell-win">-1.309 D&lt;B</td></tr>
+<tr><td><strong>100%</strong></td><td class="cell-loss">0.008 B&lt;D</td><td class="cell-win">-0.295 D&lt;B</td><td class="cell-win">-0.599 D&lt;B</td><td class="cell-win">-1.207 D&lt;B</td><td class="cell-win">-1.815 D&lt;B</td></tr>
+
+                    </tbody>
+                </table>
+            </div>
+    <div class="table-card" style="margin-bottom: 20px;">
+                            <h2>Break-Even Residual Leakage eff_leak* (All-In(D, 35ms) == All-In(B, 70ms))</h2>
+                            <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
+                                Maximum tolerable effective leakage rate in Regime D before All-In(D) reaches parity with Regime B (50% MM MEV share). Dywe is cheaper whenever <code>eff_leak &lt; eff_leak*</code>.
+                            </p>
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Ambient Capture / Impact</th>
+                                        <th>Cancel-Batch (26.7%)</th>
+                                        <th>50.0% Exposed</th>
+                                        <th>75.0% Exposed</th>
+                                        <th>100.0% Exposed (All)</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td><strong>10% / 0.500 bp</strong></td><td>31.6%</td><td>16.9%</td><td>11.3%</td><td>8.4%</td></tr>
+<tr><td><strong>10% / 1.000 bp</strong></td><td>34.5%</td><td>18.4%</td><td>12.3%</td><td>9.2%</td></tr>
+<tr><td><strong>25% / 1.000 bp</strong></td><td>90.5%</td><td>48.5%</td><td>32.3%</td><td>24.2%</td></tr>
+<tr><td><strong>50% / 1.000 bp</strong></td><td>&gt;100.0%</td><td>98.5%</td><td>65.7%</td><td>49.2%</td></tr>
+<tr><td><strong>50% / 2.000 bp</strong></td><td>&gt;100.0%</td><td>99.3%</td><td>66.2%</td><td>49.6%</td></tr>
+
+                                </tbody>
+                            </table>
+                        </div>
+
+    <div class="bounds-box"><h3>External Venue Documentation &amp; Parameterized Assumptions</h3><ul><li><strong>Hyperliquid: intra-batch priority order:</strong> Official docs (hyperliquid-l1/order-book, accessed Nov 2026) state that within each consensus batch, non-GTC/IOC actions (i.e. post-only / ALO) are processed first, followed by cancels, followed by GTC/IOC orders. Model this with `--b-batch-order hl`. <em>Source: https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-l1/order-book</em></li><li><strong>Hyperliquid: block interval &amp; buckets:</strong> Official docs (for-developers/api/priority-fees, accessed Nov 2026) state that IOC orders are sorted in 70 ms unix-time buckets, typically corresponding to one block (with 1-2 consensus batches per block). End-to-end co-located latency is cited around ~0.2 s median in third-party mirrors. <em>Source: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/priority-fees ; https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/overview</em></li><li><strong>dYdX Chain (v4): block time:</strong> Official onboarding FAQ (accessed Nov 2026) states an average block time of ~1 second and best-effort short-term cancels until block finality. Use `--b-window-ms 1000` to evaluate a 1-second batching cadence. <em>Source: https://docs.dydx.xyz/concepts/onboarding-faqs</em></li><li><strong>Not documented (parameterized assumptions):</strong> No venue documentation specifies MM reaction time, requote threshold, feed latency, client-to-sequencer transit, or sniper reaction time. Sweep `--mm-react` (e.g. 1,2,5,10,25,40) and `--requote-thr-sub` (e.g. 15,50,150) rather than trusting a single point. <em>Source: n/a</em></li></ul><h3 style="margin-top: 14px;">Dywe Protocol Design Parameters &amp; Threat Model</h3><ul><li><strong>Dywe micro-batch window &amp; threshold decryption RTT:</strong> The 50 ms micro-batch window and 35 ms / 70 ms threshold decryption RTTs are Dywe protocol design parameters, not live multi-region Devnet measurements. No BLS12-381 cryptographic operations are executed inside this microstructure simulator.</li><li><strong>Unified post-decrypt threat model &amp; exposure mode:</strong> All order messages (New ALO, Cancel, Taker) are threshold-encrypted client-side (BLS12-381) with uniform frame padding until batch_close, decrypting in matching-engine memory at clear_ns = batch_close + decrypt_ms before New (ALO) -&gt; Cancel -&gt; Taker sorting (`--d-batch-order hl`). Under `--d-exposure-mode all` (default), `eff_leak = min(leak_ppm, capture_ppm)` applies uniformly across all large bursts; under `cancel-batch` (legacy v0.3.4), it applies only to batches containing an MM cancel.</li><li><strong>Stylized model disclaimer:</strong> Regimes B (70 ms / 200 ms / 1000 ms) are stylized batching models, not byte-for-byte reproductions of Hyperliquid or dYdX matching engines.</li></ul></div>
+
+    <div class="bounds-box">
+        <h3>Methodological Scope &amp; Statistical Boundaries</h3>
+        <ul>
+            <li><strong>Regime D timeline &amp; exposure:</strong> orders commit at <code>batch_close</code>, decrypt at <code>clear_ns = batch_close + decrypt_ms</code>, and clear using <code>hl</code> ordering. Windows: B 70ms (hl), C 100ms, D 50ms (hl). Exposure mode: <code>all</code>.</li>
+            <li><strong>MM requote &amp; sniper probe parameters:</strong> representative MM requotes when mid moves &ge;<code>1.500 bp</code> (<code>--requote-thr-sub</code>); synthetic probe triggers at &ge;<code>2.000 bp</code> (<code>--sniper-thr-sub</code>) with 2 ms reaction and $25000 clip (<code>--sniper-clip</code>).</li>
+            <li><strong>1-ms burst aggregation:</strong> <code>merge_taker</code> aggregates same-millisecond, same-direction executions; inspect Raw Taker Diagnostics above for the unmerged lower bound.</li>
+            <li><strong>95% bootstrap CI:</strong> joint 3-hour block resampling (24 blocks). Quantifies drift sampling variance under fixed scenario assumptions and does not account for volatility autocorrelation or parameter uncertainty.</li>
+        </ul>
+    </div>
+</div>
+
+<script>
+    Chart.defaults.color = '#94a3b8';
+    Chart.defaults.font.family = "'Inter', -apple-system, sans-serif";
+    const horizons = ['0 ms', '100 ms', '1000 ms'];
+
+    function makeMarkoutChart(canvasId, dD, dB, dC, dA) {
+        new Chart(document.getElementById(canvasId), {
+            type: 'line',
+            data: {
+                labels: horizons,
+                datasets: [
+                    {
+                        label: 'Regime D: IBTE (50ms, 35ms dec, hl)',
+                        data: dD,
+                        borderColor: '#c28aff',
+                        backgroundColor: 'rgba(194, 138, 255, 0.12)',
+                        borderWidth: 3,
+                        pointRadius: 4.5,
+                        tension: 0.2
+                    },
+                    {
+                        label: 'Regime B: Batch (70ms, hl)',
+                        data: dB,
+                        borderColor: '#38bdf8',
+                        borderWidth: 2,
+                        borderDash: [5, 5],
+                        pointRadius: 3.5,
+                        tension: 0.2
+                    },
+                    {
+                        label: 'Regime C: Uniform-Price FBA (100ms)',
+                        data: dC,
+                        borderColor: '#f59e0b',
+                        borderWidth: 2,
+                        pointRadius: 3.5,
+                        tension: 0.2
+                    },
+                    {
+                        label: 'Regime A: Continuous FIFO',
+                        data: dA,
+                        borderColor: '#f43f5e',
+                        borderWidth: 2,
+                        pointRadius: 3.5,
+                        tension: 0.2
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { position: 'bottom', labels: { boxWidth: 12, padding: 14, font: { size: 11.5 } } }
+                },
+                scales: {
+                    y: {
+                        grid: { color: '#1e293b' },
+                        title: { display: true, text: 'Signed MM Markout (bps)' }
+                    },
+                    x: { grid: { color: '#1e293b' } }
+                }
+            }
+        });
+    }
+
+    makeMarkoutChart('chartSym1', [-0.598, -0.679, -0.722], [-0.501, -0.613, -0.660], [-0.453, -0.560, -0.612], [-0.871, -1.041, -1.115]);
+    makeMarkoutChart('chartSym2', [-0.722, -0.809, -0.855], [-0.529, -0.663, -0.710], [-0.479, -0.603, -0.654], [-1.129, -1.321, -1.395]);
+</script>
+</body>
+</html>

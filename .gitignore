@@ -7,3 +7,6 @@ data/*
 data_l1/
 target/
 data/
+
+.DS_Store
+.vscode/

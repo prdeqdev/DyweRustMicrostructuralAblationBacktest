@@ -12,6 +12,7 @@ use std::time::Instant;
 // Constants & Fixed-Point Scaling
 // ============================================================================
 
+const VERSION: &str = "v0.3.5";
 const PRICE_SCALE: i64 = 100_000_000; // 1e8
 const QTY_SCALE: i64 = 100_000_000;   // 1e8
 /// 1 "sub" unit = 1e-6 relative price; 100 sub = 1.00 bps.
@@ -139,6 +140,23 @@ impl BatchOrder {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExposureMode {
+    /// Apply leak_ppm uniformly to all large orders (consistent with full payload encryption & uniform padding).
+    All,
+    /// Legacy v0.3.4 mode: apply leak_ppm only to large orders inside batches containing an MM cancel.
+    CancelBatch,
+}
+
+impl ExposureMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            ExposureMode::All => "all",
+            ExposureMode::CancelBatch => "cancel-batch",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MidMode {
     BidAskProxy,
     TradeHalfTick,
@@ -155,11 +173,8 @@ impl MidMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MidSource {
-    /// Use native L1 bookTicker if present; fall back to trade proxy only when --allow-reconstructed is set.
     Auto,
-    /// Require native L1 bookTicker CSVs; fail/skip if absent.
     BookTicker,
-    /// Force trade-derived midpoint proxy even if bookTicker CSVs exist (enables same-day apples-to-apples validation).
     Proxy,
 }
 
@@ -175,9 +190,7 @@ impl MidSource {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WaitCohort {
-    /// Volume-weighted waiting drift over ALL executed takers (denominator = tk_n).
     All,
-    /// Volume-weighted waiting drift over large takers (>= large_usd, denominator = tk_inf_n).
     Large,
 }
 
@@ -207,6 +220,46 @@ impl ProxyDiag {
     }
 }
 
+#[derive(Clone, Copy, Default, Debug)]
+struct RawTakerDiag {
+    raw_rows: usize,
+    raw_vol_usd: i128,
+    raw_large_rows: usize,
+    raw_large_vol_usd: i128,
+    merged_bursts: usize,
+    merged_vol_usd: i128,
+    merged_large_bursts: usize,
+    merged_large_vol_usd: i128,
+}
+
+impl RawTakerDiag {
+    fn merge(&mut self, o: &RawTakerDiag) {
+        self.raw_rows += o.raw_rows;
+        self.raw_vol_usd += o.raw_vol_usd;
+        self.raw_large_rows += o.raw_large_rows;
+        self.raw_large_vol_usd += o.raw_large_vol_usd;
+        self.merged_bursts += o.merged_bursts;
+        self.merged_vol_usd += o.merged_vol_usd;
+        self.merged_large_bursts += o.merged_large_bursts;
+        self.merged_large_vol_usd += o.merged_large_vol_usd;
+    }
+
+    fn finalize_merged(&mut self, takers: &[Taker], large_usd: i64) {
+        self.merged_bursts = takers.len();
+        self.merged_vol_usd = 0;
+        self.merged_large_bursts = 0;
+        self.merged_large_vol_usd = 0;
+        for t in takers {
+            let n = t.notional_usd.max(1) as i128;
+            self.merged_vol_usd += n;
+            if t.notional_usd >= large_usd {
+                self.merged_large_bursts += 1;
+                self.merged_large_vol_usd += n;
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BookTickerDiag {
     files_loaded: usize,
@@ -216,7 +269,6 @@ struct BookTickerDiag {
     distinct_mids: usize,
     dt_sum_ms: i128,
     dt_intervals: usize,
-    /// Exact 1-ms bucket histogram for inter-update intervals [0..=10_000 ms]; index 10_000 = >=10s.
     dt_hist: Vec<usize>,
 }
 
@@ -447,6 +499,24 @@ impl Agg {
             0
         }
     }
+
+    /// Dropped taker USD share in parts per 100,000 (1 = 0.001%, 100_000 = 100.000%).
+    fn dropped_usd_p100k(&self) -> i128 {
+        let tot = self.tk_n + self.tk_dropped_usd;
+        if tot > 0 {
+            self.tk_dropped_usd * 100_000 / tot
+        } else {
+            0
+        }
+    }
+
+    fn cancel_batch_exp_ppm(&self) -> i128 {
+        if self.tk_large_n > 0 {
+            self.tk_large_exp_n * 1_000_000 / self.tk_large_n
+        } else {
+            0
+        }
+    }
 }
 
 fn total(blocks: &[Agg]) -> Agg {
@@ -511,8 +581,6 @@ fn gen_mm_events(mids: &[Mid], cfg: &Cfg) -> Vec<Ev> {
         if rel_sub(m.mid, intended_ref).abs() >= cfg.requote_thr_sub {
             let decision_ms = seen_ms + cfg.mm_react_ms;
             let new_ref = mid_at(mids, decision_ms - cfg.feed_ms);
-            // Full sub-millisecond jitter [0..999_999 ns] allows natural Cancel/New splits
-            // across discrete batch boundaries with physical probability (50 us / window_ms).
             let jitter = rng.range_i64(0, 999_999);
             let arr = (decision_ms + cfg.net_ms) * NS_PER_MS + jitter;
             out.push(Ev {
@@ -810,8 +878,6 @@ impl<'a> Sim<'a> {
                 });
             }
             BatchOrder::Hl => {
-                // Post-only first order (executed in memory post-decrypt for Regime D):
-                // Class 0: New (ALO / post-only), Class 1: Cancel, Class 2: Taker / Sniper.
                 buf.sort_by_key(|e| {
                     let cls = match e.kind {
                         Kind::New { .. } => 0u8,
@@ -1129,6 +1195,7 @@ struct Econ {
     opex_sub: i128,
     horizon: usize,
     wait_cohort: WaitCohort,
+    d_exposure: ExposureMode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1166,11 +1233,12 @@ fn evaluate(a: &Agg, regime: Regime, e: &Econ) -> Option<Outcome> {
     if a.mm_n <= 0 || a.tk_n <= 0 {
         return None;
     }
-    // When ambient MEV capture is 0% (sterile zero-MEV baseline), no MEV extraction occurs
-    // regardless of metadata leakage parameters.
     let eff_leak = e.leak_ppm.min(e.capture_ppm);
     let (p, large_mm, large_tk) = if regime == Regime::IbteCancelPrio {
-        (eff_leak, a.mm_large_exp_n, a.tk_large_exp_n)
+        match e.d_exposure {
+            ExposureMode::All => (eff_leak, a.mm_large_n, a.tk_large_n),
+            ExposureMode::CancelBatch => (eff_leak, a.mm_large_exp_n, a.tk_large_exp_n),
+        }
     } else {
         (e.capture_ppm, a.mm_large_n, a.tk_large_n)
     };
@@ -1221,6 +1289,41 @@ fn delta_all_in(b: &Agg, d: &Agg, e: &Econ) -> Option<i128> {
     let ob = evaluate(b, Regime::CancelPrio, e)?;
     let od = evaluate(d, Regime::IbteCancelPrio, e)?;
     Some(od.all_in_net? - ob.all_in_net?)
+}
+
+/// Computes the exact break-even effective leakage rate `eff_leak_ppm` (where All-In(D) == All-In(B))
+/// given an assumed fraction `exp_ppm` of Regime D large orders exposed to side-channel leakage.
+/// Returns `None` if impact == 0 or denominator == 0.
+fn breakeven_leak_ppm(
+    b: &Agg,
+    d: &Agg,
+    e0: &Econ,
+    cap_ppm: i128,
+    imp_sub: i128,
+    mm_share_ppm: i128,
+    exp_ppm: i128,
+) -> Option<i128> {
+    if imp_sub <= 0 || exp_ppm <= 0 || b.mm_n <= 0 || b.tk_n <= 0 || d.mm_n <= 0 || d.tk_n <= 0 {
+        return None;
+    }
+    let ob0 = evaluate(b, Regime::CancelPrio, e0)?;
+    let od0 = evaluate(d, Regime::IbteCancelPrio, e0)?;
+    let delta0_q = od0.all_in_net? - ob0.all_in_net?;
+
+    let den: i128 = 1_000_000_000_000;
+    let b_mm_q = cap_ppm * imp_sub * mm_share_ppm * Q * b.mm_large_n / (den * b.mm_n);
+    let b_tk_q = cap_ppm * imp_sub * (1_000_000 - mm_share_ppm) * Q * b.tk_large_n / (den * b.tk_n);
+    let mev_b_q = b_mm_q + b_tk_q;
+
+    // Unit MEV in D at eff_leak = 1_000_000 (100%) scaled by exp_ppm / 1_000_000
+    let d_mm_unit_q = exp_ppm * imp_sub * mm_share_ppm * Q * d.mm_large_n / (den * d.mm_n);
+    let d_tk_unit_q =
+        exp_ppm * imp_sub * (1_000_000 - mm_share_ppm) * Q * d.tk_large_n / (den * d.tk_n);
+    let unit_d_q = d_mm_unit_q + d_tk_unit_q;
+    if unit_d_q <= 0 {
+        return None;
+    }
+    Some((mev_b_q - delta0_q) * 1_000_000 / unit_d_q)
 }
 
 fn ci95(mut v: Vec<i128>) -> Option<(i128, i128)> {
@@ -1299,8 +1402,20 @@ fn fmt_permille(v: i128) -> String {
     format!("{}{}.{}%", sign, a / 10, a % 10)
 }
 
+/// Formats parts-per-100,000 as `X.YYY%` (0.001% resolution).
+fn fmt_pct3(p100k: i128) -> String {
+    let sign = if p100k < 0 { "-" } else { "" };
+    let a = p100k.abs();
+    format!("{}{}.{:03}%", sign, a / 1000, a % 1000)
+}
+
+/// Formats parts-per-million as `XX.X%`.
+fn fmt_ppm_pct1(ppm: i128) -> String {
+    fmt_permille(ppm / 1_000)
+}
+
 fn fmt_dropped_cell(a: &Agg) -> String {
-    format!("{} ({})", a.tk_dropped, fmt_permille(a.dropped_usd_pm()))
+    format!("{} ({})", a.tk_dropped, fmt_pct3(a.dropped_usd_p100k()))
 }
 
 fn fmt_s(s: SStar) -> String {
@@ -1560,10 +1675,11 @@ fn merge_taker(takers: &mut Vec<Taker>, ts: i64, dir: i8, notional: i64) {
     });
 }
 
-fn load_agg_trades_csv(path: &Path) -> Result<Vec<Taker>, String> {
+fn load_agg_trades_csv(path: &Path, large_usd: i64) -> Result<(Vec<Taker>, RawTakerDiag), String> {
     let file = File::open(path).map_err(|e| format!("open {}: {}", path.display(), e))?;
     let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
     let mut out: Vec<Taker> = Vec::with_capacity(1_200_000);
+    let mut tdiag = RawTakerDiag::default();
     for line_res in reader.lines() {
         let line = line_res.map_err(|e| e.to_string())?;
         let t = line.trim();
@@ -1590,14 +1706,21 @@ fn load_agg_trades_csv(path: &Path) -> Result<Vec<Taker>, String> {
         };
         let ibm = parse_bool_fast(p.next().unwrap_or(""));
         let dir: i8 = if ibm { -1 } else { 1 };
-        merge_taker(&mut out, ts, dir, notional_usd(price, qty));
+        let notional = notional_usd(price, qty);
+        let n_eff = notional.max(1) as i128;
+        tdiag.raw_rows += 1;
+        tdiag.raw_vol_usd += n_eff;
+        if notional >= large_usd {
+            tdiag.raw_large_rows += 1;
+            tdiag.raw_large_vol_usd += n_eff;
+        }
+        merge_taker(&mut out, ts, dir, notional);
     }
     out.sort_by_key(|t| t.ts_ms);
-    Ok(out)
+    tdiag.finalize_merged(&out, large_usd);
+    Ok((out, tdiag))
 }
 
-/// Core pure function for reconstructing a bid/ask midpoint proxy from `(price, is_buyer_maker)`
-/// observations. Exposed for unit testing (`t_bidask_mid_proxy`).
 fn reconstruct_bidask_step(
     last_bid: &mut Option<i64>,
     last_ask: &mut Option<i64>,
@@ -1629,7 +1752,8 @@ fn load_trades_csv(
     path: &Path,
     half_tick: i64,
     mode: MidMode,
-) -> Result<(Vec<Taker>, Vec<Mid>, ProxyDiag), String> {
+    large_usd: i64,
+) -> Result<(Vec<Taker>, Vec<Mid>, ProxyDiag, RawTakerDiag), String> {
     let file = File::open(path).map_err(|e| format!("open {}: {}", path.display(), e))?;
     let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
     let mut takers: Vec<Taker> = Vec::with_capacity(2_000_000);
@@ -1637,6 +1761,7 @@ fn load_trades_csv(
     let mut last_bid: Option<i64> = None;
     let mut last_ask: Option<i64> = None;
     let mut diag = ProxyDiag::default();
+    let mut tdiag = RawTakerDiag::default();
 
     for line_res in reader.lines() {
         let line = line_res.map_err(|e| e.to_string())?;
@@ -1680,11 +1805,20 @@ fn load_trades_csv(
                 }
             }
         }
-        merge_taker(&mut takers, ts, dir, notional_usd(price, qty));
+        let notional = notional_usd(price, qty);
+        let n_eff = notional.max(1) as i128;
+        tdiag.raw_rows += 1;
+        tdiag.raw_vol_usd += n_eff;
+        if notional >= large_usd {
+            tdiag.raw_large_rows += 1;
+            tdiag.raw_large_vol_usd += n_eff;
+        }
+        merge_taker(&mut takers, ts, dir, notional);
     }
     takers.sort_by_key(|t| t.ts_ms);
     mids.sort_by_key(|m| m.ts_ms);
-    Ok((takers, mids, diag))
+    tdiag.finalize_merged(&takers, large_usd);
+    Ok((takers, mids, diag, tdiag))
 }
 
 // ============================================================================
@@ -1715,6 +1849,7 @@ struct Args {
     pending_policy: PendingPolicy,
     b_batch_order: BatchOrder,
     d_batch_order: BatchOrder,
+    d_exposure_mode: ExposureMode,
     wait_cohort: WaitCohort,
     mid_source: MidSource,
     mid_mode: MidMode,
@@ -1722,6 +1857,8 @@ struct Args {
     opex_sub: i128,
     large_usd: i64,
     sniper_clip_usd: i64,
+    requote_thr_sub: i64,
+    sniper_thr_sub: i64,
     block_hours: i64,
     allow_reconstructed: bool,
     bootstrap: usize,
@@ -1771,6 +1908,7 @@ fn parse_args() -> Args {
         pending_policy: PendingPolicy::Hold,
         b_batch_order: BatchOrder::Hl,
         d_batch_order: BatchOrder::Hl,
+        d_exposure_mode: ExposureMode::All,
         wait_cohort: WaitCohort::All,
         mid_source: MidSource::Auto,
         mid_mode: MidMode::BidAskProxy,
@@ -1778,6 +1916,8 @@ fn parse_args() -> Args {
         opex_sub: 30,
         large_usd: 50_000,
         sniper_clip_usd: 25_000,
+        requote_thr_sub: 150,
+        sniper_thr_sub: 200,
         block_hours: 3,
         allow_reconstructed: false,
         bootstrap: 1000,
@@ -1824,6 +1964,14 @@ fn parse_args() -> Args {
                     "--d-batch-order" => {
                         a.d_batch_order = parse_batch_order(&val, "--d-batch-order");
                     }
+                    "--d-exposure-mode" => match val.trim().to_ascii_lowercase().as_str() {
+                        "all" => a.d_exposure_mode = ExposureMode::All,
+                        "cancel-batch" => a.d_exposure_mode = ExposureMode::CancelBatch,
+                        _ => {
+                            eprintln!("--d-exposure-mode must be 'all' or 'cancel-batch'");
+                            std::process::exit(2);
+                        }
+                    },
                     "--wait-cohort" => match val.trim().to_ascii_lowercase().as_str() {
                         "all" => a.wait_cohort = WaitCohort::All,
                         "large" => a.wait_cohort = WaitCohort::Large,
@@ -1855,7 +2003,15 @@ fn parse_args() -> Args {
                     "--rebate-sub" => a.rebate_sub = val.parse().unwrap_or(50),
                     "--opex-sub" => a.opex_sub = val.parse().unwrap_or(30),
                     "--large-usd" => a.large_usd = val.parse().unwrap_or(50_000),
-                    "--sniper-clip" => a.sniper_clip_usd = val.parse::<i64>().unwrap_or(25_000).max(0),
+                    "--sniper-clip" => {
+                        a.sniper_clip_usd = val.parse::<i64>().unwrap_or(25_000).max(0)
+                    }
+                    "--requote-thr-sub" => {
+                        a.requote_thr_sub = val.parse::<i64>().unwrap_or(150).max(1)
+                    }
+                    "--sniper-thr-sub" => {
+                        a.sniper_thr_sub = val.parse::<i64>().unwrap_or(200).max(1)
+                    }
                     "--block-hours" => a.block_hours = val.parse().unwrap_or(3),
                     "--bootstrap" => a.bootstrap = val.parse().unwrap_or(1000),
                     "--threads" => a.threads = val.parse().unwrap_or(4),
@@ -1881,17 +2037,20 @@ fn parse_args() -> Args {
     a
 }
 
+
 fn push_core_specs(v: &mut Vec<Spec>, args: &Args, r: i64, shift: i64) {
     let suffix = if shift == 0 {
         String::new()
     } else {
-        format!(" | PLACEBO shift {}s", shift / 1000)
+        format!(", PLACEBO shift {}s", shift / 1000)
     };
     let mut base = default_cfg();
     base.mm_react_ms = r;
     base.pending_policy = args.pending_policy;
     base.large_usd = args.large_usd;
     base.sniper_clip_usd = args.sniper_clip_usd;
+    base.requote_thr_sub = args.requote_thr_sub;
+    base.sniper_thr_sub = args.sniper_thr_sub;
     let bw = args.b_window();
 
     let mut a = base;
@@ -1902,7 +2061,7 @@ fn push_core_specs(v: &mut Vec<Spec>, args: &Args, r: i64, shift: i64) {
         decrypt: 0,
         shift,
         cfg: a,
-        label: format!("A: Continuous FIFO | react {}ms{}", r, suffix),
+        label: format!("A: Continuous FIFO, react {}ms{}", r, suffix),
     });
 
     let mut b = base;
@@ -1915,7 +2074,7 @@ fn push_core_specs(v: &mut Vec<Spec>, args: &Args, r: i64, shift: i64) {
         shift,
         cfg: b,
         label: format!(
-            "B: Batch {}ms ({}) | react {}ms{}",
+            "B: Batch {}ms ({}), react {}ms{}",
             bw,
             args.b_batch_order.as_str(),
             r,
@@ -1933,7 +2092,7 @@ fn push_core_specs(v: &mut Vec<Spec>, args: &Args, r: i64, shift: i64) {
         shift,
         cfg: c,
         label: format!(
-            "C: Uniform-Price FBA {}ms | react {}ms{}",
+            "C: Uniform-Price FBA {}ms, react {}ms{}",
             args.fba_window_ms, r, suffix
         ),
     });
@@ -1950,7 +2109,7 @@ fn push_core_specs(v: &mut Vec<Spec>, args: &Args, r: i64, shift: i64) {
             shift,
             cfg: dd,
             label: format!(
-                "D: Dywe IBTE {}ms (dec {}ms, {}) | react {}ms{}",
+                "D: Dywe IBTE {}ms (dec {}ms, {}), react {}ms{}",
                 args.window_ms,
                 d,
                 args.d_batch_order.as_str(),
@@ -1960,6 +2119,7 @@ fn push_core_specs(v: &mut Vec<Spec>, args: &Args, r: i64, shift: i64) {
         });
     }
 }
+
 
 fn build_specs(args: &Args) -> Vec<Spec> {
     let mut v: Vec<Spec> = Vec::new();
@@ -1987,6 +2147,7 @@ struct DayResult {
     taker_orders: usize,
     proxy_diag: ProxyDiag,
     book_diag: BookTickerDiag,
+    taker_diag: RawTakerDiag,
 }
 
 fn run_day(
@@ -2009,6 +2170,7 @@ fn run_day(
         taker_orders: 0,
         proxy_diag: ProxyDiag::default(),
         book_diag: BookTickerDiag::default(),
+        taker_diag: RawTakerDiag::default(),
     };
     let bt_s = format!("{}/{}-bookTicker-{}.csv", args.data_dir, sym, date);
     let tr_s = format!("{}/{}-trades-{}.csv", args.data_dir, sym, date);
@@ -2017,7 +2179,7 @@ fn run_day(
     let tr = Path::new(&tr_s);
     let ag = Path::new(&ag_s);
 
-    let mut trade_takers: Option<Vec<Taker>> = None;
+    let mut trade_takers: Option<(Vec<Taker>, RawTakerDiag)> = None;
     let mut reconstructed = false;
     let mut proxy_diag = ProxyDiag::default();
     let mut book_diag = BookTickerDiag::default();
@@ -2038,9 +2200,9 @@ fn run_day(
         }
         MidSource::Proxy => {
             if tr.exists() {
-                match load_trades_csv(tr, half_tick_1e8(&sym), args.mid_mode) {
-                    Ok((t, m, diag)) => {
-                        trade_takers = Some(t);
+                match load_trades_csv(tr, half_tick_1e8(&sym), args.mid_mode, args.large_usd) {
+                    Ok((t, m, diag, td)) => {
+                        trade_takers = Some((t, td));
                         reconstructed = true;
                         proxy_diag = diag;
                         m
@@ -2061,9 +2223,9 @@ fn run_day(
                     Err(e) => return skip(format!("{} {}: {}", sym, date, e)),
                 }
             } else if args.allow_reconstructed && tr.exists() {
-                match load_trades_csv(tr, half_tick_1e8(&sym), args.mid_mode) {
-                    Ok((t, m, diag)) => {
-                        trade_takers = Some(t);
+                match load_trades_csv(tr, half_tick_1e8(&sym), args.mid_mode, args.large_usd) {
+                    Ok((t, m, diag, td)) => {
+                        trade_takers = Some((t, td));
                         reconstructed = true;
                         proxy_diag = diag;
                         m
@@ -2079,16 +2241,16 @@ fn run_day(
         }
     };
 
-    let takers: Vec<Taker> = if ag.exists() {
-        match load_agg_trades_csv(ag) {
-            Ok(t) => t,
+    let (takers, taker_diag): (Vec<Taker>, RawTakerDiag) = if ag.exists() {
+        match load_agg_trades_csv(ag, args.large_usd) {
+            Ok(x) => x,
             Err(e) => return skip(format!("{} {}: {}", sym, date, e)),
         }
-    } else if let Some(t) = trade_takers {
-        t
+    } else if let Some(x) = trade_takers {
+        x
     } else if tr.exists() {
-        match load_trades_csv(tr, 0, args.mid_mode) {
-            Ok((t, _, _)) => t,
+        match load_trades_csv(tr, 0, args.mid_mode, args.large_usd) {
+            Ok((t, _, _, td)) => (t, td),
             Err(e) => return skip(format!("{} {}: {}", sym, date, e)),
         }
     } else {
@@ -2144,11 +2306,12 @@ fn run_day(
         )
     };
     let line = format!(
-        "[OK] {:<8} {} | mid ticks {:>9} | takers {:>8} | source: {} | {:.1?}",
+        "[OK] {:<8} {} | mid ticks {:>9} | bursts {:>8} (raw {:>9}) | source: {} | {:.1?}",
         sym,
         date,
         mids.len(),
         takers.len(),
+        taker_diag.raw_rows,
         src_tag,
         t0.elapsed()
     );
@@ -2161,32 +2324,33 @@ fn run_day(
         taker_orders: takers.len(),
         proxy_diag,
         book_diag,
+        taker_diag,
     }
 }
 
 // ============================================================================
-// Calibration & Design Notes (separated: external docs vs. Dywe parameters)
+// Calibration & Design Notes
 // ============================================================================
 
 const EXTERNAL_CALIBRATION_NOTES: [(&str, &str, &str); 4] = [
     (
         "Hyperliquid: intra-batch priority order",
-        "Official docs (hyperliquid-l1/order-book) state that within each consensus batch, non-GTC/IOC actions (i.e. post-only / ALO) are processed first, followed by cancels, followed by GTC/IOC orders. Thus new MM post-only quotes land before cancels and takers without a dead gap. Model this with `--b-batch-order hl`.",
+        "Official docs (hyperliquid-l1/order-book, accessed Nov 2026) state that within each consensus batch, non-GTC/IOC actions (i.e. post-only / ALO) are processed first, followed by cancels, followed by GTC/IOC orders. Model this with `--b-batch-order hl`.",
         "https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-l1/order-book",
     ),
     (
         "Hyperliquid: block interval & buckets",
-        "Official docs (for-developers/api/priority-fees) state that IOC orders are sorted in 70 ms unix-time buckets, typically corresponding to one block (with 1-2 consensus batches per block, meaning effective batch windows may be shorter than 70 ms). End-to-end co-located latency is cited around ~0.2 s median in third-party mirrors.",
+        "Official docs (for-developers/api/priority-fees, accessed Nov 2026) state that IOC orders are sorted in 70 ms unix-time buckets, typically corresponding to one block (with 1-2 consensus batches per block). End-to-end co-located latency is cited around ~0.2 s median in third-party mirrors.",
         "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/priority-fees ; https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/overview",
     ),
     (
         "dYdX Chain (v4): block time",
-        "The official onboarding FAQ states an average block time of about 1 second, and that short-term order cancels are best effort until the block is final. Use `--b-window-ms 1000` to evaluate a 1-second batching cadence.",
+        "Official onboarding FAQ (accessed Nov 2026) states an average block time of ~1 second and best-effort short-term cancels until block finality. Use `--b-window-ms 1000` to evaluate a 1-second batching cadence.",
         "https://docs.dydx.xyz/concepts/onboarding-faqs",
     ),
     (
-        "Not documented (stay parameterized assumptions)",
-        "No venue documentation specifies MM reaction time, market-data feed latency, client-to-sequencer network transit, or latency-arbitrageur reaction time. Defaults (feed 5 ms, MM reaction 10 ms, sniper reaction 2 ms, network 30 ms) are parameterized assumptions; sweep `--mm-react` rather than trusting a single point.",
+        "Not documented (parameterized assumptions)",
+        "No venue documentation specifies MM reaction time, requote threshold, feed latency, client-to-sequencer transit, or sniper reaction time. Sweep `--mm-react` (e.g. 1,2,5,10,25,40) and `--requote-thr-sub` (e.g. 15,50,150) rather than trusting a single point.",
         "n/a",
     ),
 ];
@@ -2194,11 +2358,11 @@ const EXTERNAL_CALIBRATION_NOTES: [(&str, &str, &str); 4] = [
 const DYWE_DESIGN_NOTES: [(&str, &str); 3] = [
     (
         "Dywe micro-batch window & threshold decryption RTT",
-        "The 50 ms micro-batch window and 35 ms / 70 ms threshold decryption RTTs are Dywe protocol design parameters, not live multi-region Devnet measurements.",
+        "The 50 ms micro-batch window and 35 ms / 70 ms threshold decryption RTTs are Dywe protocol design parameters, not live multi-region Devnet measurements. No BLS12-381 cryptographic operations are executed inside this microstructure simulator.",
     ),
     (
-        "Unified post-decrypt threat model",
-        "All order messages (New ALO, Cancel, Taker) are threshold-encrypted client-side (BLS12-381) until batch_close. Threshold decryption completes in matching-engine memory at clear_ns = batch_close + decrypt_ms before the first fill executes, enabling deterministic New (ALO) -> Cancel -> Taker ordering (--d-batch-order hl) without leaking ALO/IOC flags pre-commit. The leak_ppm grid models potential residual side-channel/timing leakage on batches with MM cancels (0% under full cryptographic payload/metadata padding; 10%-50% stress sensitivity).",
+        "Unified post-decrypt threat model & exposure mode",
+        "All order messages (New ALO, Cancel, Taker) are threshold-encrypted client-side (BLS12-381) with uniform frame padding until batch_close, decrypting in matching-engine memory at clear_ns = batch_close + decrypt_ms before New (ALO) -> Cancel -> Taker sorting (`--d-batch-order hl`). Under `--d-exposure-mode all` (default), `eff_leak = min(leak_ppm, capture_ppm)` applies uniformly across all large bursts; under `cancel-batch` (legacy v0.3.4), it applies only to batches containing an MM cancel.",
     ),
     (
         "Stylized model disclaimer",
@@ -2340,6 +2504,7 @@ mod selfcheck {
             opex_sub: 30,
             horizon: 2,
             wait_cohort: WaitCohort::All,
+            d_exposure: ExposureMode::All,
         };
         let tb = total(&ob.agg);
         let td = total(&od.agg);
@@ -2445,6 +2610,7 @@ mod selfcheck {
                 opex_sub: 0,
                 horizon: 2,
                 wait_cohort: WaitCohort::All,
+                d_exposure: ExposureMode::All,
             };
             let o = evaluate(&a, Regime::CancelPrio, &e).ok_or("evaluate returned None")?;
             let got = o.mev_mm_q * n + o.mev_tk_q * n;
@@ -2492,6 +2658,7 @@ mod selfcheck {
             opex_sub: 30,
             horizon: 2,
             wait_cohort: WaitCohort::All,
+            d_exposure: ExposureMode::All,
         };
         for &r in regimes.iter() {
             let cfg = cfg_for(r);
@@ -2718,6 +2885,7 @@ mod selfcheck {
             opex_sub: 30,
             horizon: 2,
             wait_cohort: WaitCohort::All,
+            d_exposure: ExposureMode::All,
         };
         let mut e_large = e_all;
         e_large.wait_cohort = WaitCohort::Large;
@@ -2763,13 +2931,12 @@ mod selfcheck {
     pub fn book_ticker_diag() -> Result<String, String> {
         let mut v: Vec<Mid> = Vec::new();
         let mut d = BookTickerDiag::default();
-        // 5 raw ticks: 2 same-ms, 1 unchanged mid, 3 distinct mids at ts=10, 12, 16 -> intervals 2ms, 4ms (median 4ms)
         let ticks = [
             (10i64, 100 * PRICE_SCALE),
-            (10i64, 101 * PRICE_SCALE), // same ms collapsed
-            (11i64, 101 * PRICE_SCALE), // unchanged mid skipped
-            (12i64, 102 * PRICE_SCALE), // added (dt=2)
-            (16i64, 103 * PRICE_SCALE), // added (dt=4)
+            (10i64, 101 * PRICE_SCALE),
+            (11i64, 101 * PRICE_SCALE),
+            (12i64, 102 * PRICE_SCALE),
+            (16i64, 103 * PRICE_SCALE),
         ];
         for (ts, mid) in ticks {
             d.raw_rows += 1;
@@ -2796,6 +2963,8 @@ mod selfcheck {
         let a = Agg {
             mm_n: 1_000_000,
             tk_n: 1_000_000,
+            mm_large_n: 700_000,
+            tk_large_n: 700_000,
             mm_large_exp_n: 500_000,
             tk_large_exp_n: 500_000,
             ..Agg::default()
@@ -2809,6 +2978,7 @@ mod selfcheck {
             opex_sub: 30,
             horizon: 2,
             wait_cohort: WaitCohort::All,
+            d_exposure: ExposureMode::All,
         };
         let o = evaluate(&a, Regime::IbteCancelPrio, &e).ok_or("evaluate None")?;
         if o.mev_mm_q != 0 || o.mev_tk_q != 0 {
@@ -2820,8 +2990,78 @@ mod selfcheck {
         Ok("capture=0% enforces zero MEV extraction regardless of leak_ppm".to_string())
     }
 
+    pub fn d_exposure_modes_and_breakeven() -> Result<String, String> {
+        let a = Agg {
+            mm_n: 1_000_000,
+            mm_w: [-100_000_000, -100_000_000, -100_000_000], // -1.000 bp
+            tk_n: 1_000_000,
+            tk_scoef_w: 1_000_000,
+            mm_large_n: 800_000,
+            tk_large_n: 800_000,
+            mm_large_exp_n: 200_000,
+            tk_large_exp_n: 200_000,
+            ..Agg::default()
+        };
+        let e_all = Econ {
+            capture_ppm: 250_000,
+            impact_sub: 100,
+            mm_share_ppm: 500_000,
+            leak_ppm: 250_000,
+            rebate_sub: 50,
+            opex_sub: 30,
+            horizon: 2,
+            wait_cohort: WaitCohort::All,
+            d_exposure: ExposureMode::All,
+        };
+        let mut e_cb = e_all;
+        e_cb.d_exposure = ExposureMode::CancelBatch;
+
+        let ob = evaluate(&a, Regime::CancelPrio, &e_all).ok_or("ob None")?;
+        let od_all = evaluate(&a, Regime::IbteCancelPrio, &e_all).ok_or("od_all None")?;
+        let od_cb = evaluate(&a, Regime::IbteCancelPrio, &e_cb).ok_or("od_cb None")?;
+
+        if ob.mev_mm_q != od_all.mev_mm_q || ob.mev_tk_q != od_all.mev_tk_q {
+            return Err("d_exposure_mode::All should equal B when leak == capture".to_string());
+        }
+        if od_cb.mev_mm_q * 4 != od_all.mev_mm_q {
+            return Err("d_exposure_mode::CancelBatch should scale by 200k/800k = 1/4".to_string());
+        }
+
+        let e0 = Econ {
+            capture_ppm: 0,
+            impact_sub: 0,
+            mm_share_ppm: 500_000,
+            leak_ppm: 0,
+            rebate_sub: 50,
+            opex_sub: 30,
+            horizon: 2,
+            wait_cohort: WaitCohort::All,
+            d_exposure: ExposureMode::All,
+        };
+        let be = breakeven_leak_ppm(&a, &a, &e0, 250_000, 100, 500_000, 1_000_000)
+            .ok_or("breakeven_leak_ppm returned None")?;
+        if be != 250_000 {
+            return Err(format!("expected breakeven leak 250_000 ppm at 100% exposure, got {}", be));
+        }
+        Ok("ExposureMode::All vs CancelBatch and break-even leak math verified".to_string())
+    }
+
+    pub fn dropped_precision() -> Result<String, String> {
+        let a = Agg {
+            tk_n: 99_995_000,
+            tk_dropped: 10,
+            tk_dropped_usd: 5_000, // 0.005%
+            ..Agg::default()
+        };
+        let s = fmt_dropped_cell(&a);
+        if s != "10 (0.005%)" {
+            return Err(format!("dropped_precision: expected '10 (0.005%)', got '{}'", s));
+        }
+        Ok("fmt_dropped_cell resolves sub-0.1% dropped USD to 0.001% precision".to_string())
+    }
+
     pub fn run_all() -> bool {
-        let checks: [(&str, fn() -> Result<String, String>); 15] = [
+        let checks: [(&str, fn() -> Result<String, String>); 17] = [
             ("causality (no look-ahead)", causality),
             ("identity D==B (decrypt=0, mev=0, leak=0)", identity),
             ("shuffled-side zero-spread + sign control", shuffled_zero_spread),
@@ -2837,6 +3077,8 @@ mod selfcheck {
             ("BidAskProxy midpoint & crossed diagnostics", bidask_mid_proxy),
             ("BookTicker raw/dedup/interval diagnostics", book_ticker_diag),
             ("Zero capture enforces zero MEV under leak>0", zero_capture_zero_mev),
+            ("ExposureMode (all vs cancel-batch) & break-even leak", d_exposure_modes_and_breakeven),
+            ("Dropped USD 0.001% display precision", dropped_precision),
         ];
         let mut ok = true;
         for (name, f) in checks.iter() {
@@ -2917,6 +3159,14 @@ mod tests {
         selfcheck::zero_capture_zero_mev().unwrap();
     }
     #[test]
+    fn t_d_exposure_modes_and_breakeven() {
+        selfcheck::d_exposure_modes_and_breakeven().unwrap();
+    }
+    #[test]
+    fn t_dropped_precision() {
+        selfcheck::dropped_precision().unwrap();
+    }
+    #[test]
     fn t_html_escape() {
         assert_eq!(super::html_escape("D<B & B<D"), "D&lt;B &amp; B&lt;D");
     }
@@ -2936,6 +3186,7 @@ fn base_econ(args: &Args) -> Econ {
         opex_sub: args.opex_sub,
         horizon: 2,
         wait_cohort: args.wait_cohort,
+        d_exposure: args.d_exposure_mode,
     }
 }
 
@@ -2956,12 +3207,12 @@ fn table(rep: &mut String, title: &str, specs: &[Spec], totals: &[Agg], shift: i
     emit!(rep, "\n### {}", title);
     emit!(
         rep,
-        "| Regime | MM Total Vol | Markout 0ms | 100ms | 1s | s* gross | s* net | [1] Spread Paid | [2] Taker Stale | {} | [=] All-In Net ([1]+[2]+[3]) | StaleSnipe Hit/Miss | Dropped Takers (USD%) | Batches |",
+        "| Regime | MM Total Vol (incl. Probe) | Hist Taker Vol | Markout 0ms | 100ms | 1s | s* gross | s* net | [1] Spread Paid | [2] Taker Stale | {} | [=] All-In Net ([1]+[2]+[3]) | StaleSnipe Hit/Miss | Dropped Takers (USD%) | Batches |",
         wait_col
     );
     emit!(
         rep,
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     );
     for (sp, a) in specs.iter().zip(totals.iter()) {
         if sp.shift != shift {
@@ -2969,7 +3220,7 @@ fn table(rep: &mut String, title: &str, specs: &[Spec], totals: &[Agg], shift: i
         }
         match evaluate(a, sp.regime, &e0) {
             None => {
-                emit!(rep, "| {} | n/a | | | | | | | | | | | | |", sp.label);
+                emit!(rep, "| {} | n/a | | | | | | | | | | | | | |", sp.label);
             }
             Some(o) => {
                 let m0 = a.mm_w[0] * Q / a.mm_n;
@@ -2977,9 +3228,10 @@ fn table(rep: &mut String, title: &str, specs: &[Spec], totals: &[Agg], shift: i
                 let m2 = a.mm_w[2] * Q / a.mm_n;
                 emit!(
                     rep,
-                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {}/{} | {} | {} |",
+                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {}/{} | {} | {} |",
                     sp.label,
                     fmt_usd(a.mm_n),
+                    fmt_usd(a.tk_n),
                     fmt_bps(m0),
                     fmt_bps(m1),
                     fmt_bps(m2),
@@ -3004,8 +3256,10 @@ fn table(rep: &mut String, title: &str, specs: &[Spec], totals: &[Agg], shift: i
     };
     emit!(
         rep,
-        "\nUnits: bps. Exact identity at MEV=0: `[1] Spread Paid + [2] Taker Stale + [3] Wait = All-In Net` (within 0.001 bps display rounding; wait_cohort=`{}`).{}",
+        "\nUnits: bps. Exact identity at MEV=0: `[1] Spread Paid + [2] Taker Stale + [3] Wait = All-In Net` (within 0.001 bps display rounding; wait_cohort=`{}`; requote_thr=`{} bp`, sniper_thr=`{} bp`).{}",
         args.wait_cohort.as_str(),
+        fmt_bps((args.requote_thr_sub as i128) * Q),
+        fmt_bps((args.sniper_thr_sub as i128) * Q),
         drop_note
     );
 }
@@ -3014,7 +3268,7 @@ fn cohort_table(rep: &mut String, title: &str, specs: &[Spec], totals: &[Agg], a
     emit!(rep, "\n### {} — MM Flow Cohort Decomposition & Volume Reconciliation", title);
     emit!(
         rep,
-        "| Regime | Taker Vol | StaleSnipe Vol | LateSnipe Vol | Total MM Vol | Vol Diff | Taker 1s Markout | StaleSnipe 1s Markout | LateSnipe 1s Markout | Large Vol % (>={}) | Cancel-Batch Large % |",
+        "| Regime | Taker Vol | StaleSnipe Vol | LateSnipe Vol | Total MM Vol | Vol Diff | Taker 1s Markout | StaleSnipe 1s Markout | LateSnipe 1s Markout | 1-ms Burst Vol % (>={}) | Cancel-Batch Large % |",
         fmt_usd(args.large_usd as i128)
     );
     emit!(rep, "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
@@ -3067,7 +3321,7 @@ fn cohort_table(rep: &mut String, title: &str, specs: &[Spec], totals: &[Agg], a
     }
     emit!(
         rep,
-        "\nReconciliation note: `Taker Vol` reflects historical exchange flow (`aggTrades`/`trades`); `StaleSnipe` and `LateSnipe` reflect the parameterized latency-arb probe (`--sniper-clip`, default $25,000). In Regime C (Uniform-Price FBA), taker and sniper orders net internally into a single imbalance before clearing against the MM. `Cancel-Batch Large %` shows the share of large orders arriving inside a batch that also contains an MM cancel."
+        "\nReconciliation note: `Taker Vol` reflects historical exchange flow (`aggTrades`/`trades`); `StaleSnipe` and `LateSnipe` reflect the parameterized latency-arb probe (`--sniper-clip`, default $25,000). `1-ms Burst Vol %` reflects directional trades merged within the same millisecond (`merge_taker`); see Raw Taker Diagnostics above for the unmerged lower bound."
     );
 }
 
@@ -3164,9 +3418,10 @@ fn frontier(
     full: &[Agg],
     boot: &[Vec<Agg>],
     args: &Args,
-) -> Vec<FrontierGrid> {
+) -> (Vec<FrontierGrid>, String) {
     let mut html_grids = Vec::new();
-    csv.push_str("react_ms,decrypt_ms,b_window_ms,d_window_ms,b_batch_order,d_batch_order,pending_policy,mid_source,mid_mode,wait_cohort,rebate_sub,opex_sub,b_dropped_usd_pm,d_dropped_usd_pm,capture_ppm,impact_sub,mm_share_ppm,leak_ppm,allin_B_q,allin_D_q,delta_D_minus_B_q,ci_lo_q,ci_hi_q,verdict\n");
+    let mut be_html = String::new();
+    csv.push_str("react_ms,decrypt_ms,b_window_ms,d_window_ms,b_batch_order,d_batch_order,d_exposure_mode,requote_thr_sub,sniper_thr_sub,pending_policy,mid_source,mid_mode,wait_cohort,rebate_sub,opex_sub,b_dropped_usd_p100k,d_dropped_usd_p100k,capture_ppm,impact_sub,mm_share_ppm,leak_ppm,allin_B_q,allin_D_q,delta_D_minus_B_q,ci_lo_q,ci_hi_q,verdict\n");
     for &react in &args.mm_react {
         let ib = match find_spec(specs, Regime::CancelPrio, react, 0, 0) {
             Some(i) => i,
@@ -3179,13 +3434,13 @@ fn frontier(
             };
             let bw = specs[ib].cfg.window_ms;
             let dw = specs[id].cfg.window_ms;
-            let db_pm = full[ib].dropped_usd_pm();
-            let dd_pm = full[id].dropped_usd_pm();
-            let bias_warn = if (db_pm - dd_pm).abs() >= 10 {
+            let db_p100k = full[ib].dropped_usd_p100k();
+            let dd_p100k = full[id].dropped_usd_p100k();
+            let bias_warn = if (db_p100k - dd_p100k).abs() >= 1_000 {
                 Some(format!(
-                    "Dropped taker USD share differs materially between B ({}) and D ({}). Direct All-In comparison is confounded by fill-rate selection bias; use `--pending-policy hold` or matching batch orders (`--b-batch-order hl --d-batch-order hl`) for equal-volume cost comparison.",
-                    fmt_permille(db_pm),
-                    fmt_permille(dd_pm)
+                    "Dropped taker USD share differs materially between B ({}) and D ({}). Direct All-In comparison is confounded by fill-rate selection bias; use `--pending-policy hold` or matching batch orders (`--b-batch-order hl --d-batch-order hl`).",
+                    fmt_pct3(db_p100k),
+                    fmt_pct3(dd_p100k)
                 ))
             } else {
                 None
@@ -3205,6 +3460,7 @@ fn frontier(
                                 opex_sub: args.opex_sub,
                                 horizon: 2,
                                 wait_cohort: args.wait_cohort,
+                                d_exposure: args.d_exposure_mode,
                             };
                             let ab = evaluate(&full[ib], Regime::CancelPrio, &e)
                                 .and_then(|o| o.all_in_net);
@@ -3226,21 +3482,24 @@ fn frontier(
                                 None => (String::new(), String::new()),
                             };
                             csv.push_str(&format!(
-                                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                                 react,
                                 dec,
                                 bw,
                                 dw,
                                 args.b_batch_order.as_str(),
                                 args.d_batch_order.as_str(),
+                                args.d_exposure_mode.as_str(),
+                                args.requote_thr_sub,
+                                args.sniper_thr_sub,
                                 args.pending_policy.as_str(),
                                 args.mid_source.as_str(),
                                 args.mid_mode.as_str(),
                                 args.wait_cohort.as_str(),
                                 args.rebate_sub,
                                 args.opex_sub,
-                                db_pm,
-                                dd_pm,
+                                db_p100k,
+                                dd_p100k,
                                 cap,
                                 imp,
                                 share,
@@ -3265,12 +3524,13 @@ fn frontier(
             if react == args.mm_react[0] {
                 emit!(
                     rep,
-                    "\n#### Break-Even Frontier: All-In(D) − All-In(B) (bps) | B {}ms ({}), D {}ms (dec {}ms, {}) | react {}ms | pending={} | src={} | wait={}",
+                    "\n#### Break-Even Frontier: All-In(D) − All-In(B) (bps) | B {}ms ({}), D {}ms (dec {}ms, {}, exp={}), react {}ms | pending={} | src={} | wait={}",
                     bw,
                     args.b_batch_order.as_str(),
                     dw,
                     dec,
                     args.d_batch_order.as_str(),
+                    args.d_exposure_mode.as_str(),
                     react,
                     args.pending_policy.as_str(),
                     args.mid_source.as_str(),
@@ -3281,7 +3541,7 @@ fn frontier(
                 }
                 emit!(
                     rep,
-                    "Rows: MEV capture rate on large orders (>={}) in Regime B. Columns: per-order MEV impact (bps). Verdict: `D<B` = Dywe cheaper for takers (95% CI < 0); `B<D` = Regime B cheaper; `~` = statistically indistinguishable. **Every cell except the 0%-capture row is a parameterized scenario output, not a measurement.**",
+                    "Rows: MEV capture rate on 1-ms bursts (>={}) in Regime B. Columns: per-order MEV impact (bps). Fixed slice: 50% MM share, 10% leak (`eff_leak = min(leak, capture)`). Verdict: `D<B` = Dywe cheaper (95% CI < 0); `B<D` = Regime B cheaper; `~` = indistinguishable. **Every cell except 0%-capture is a parameterized scenario output, not a measurement.**",
                     fmt_usd(args.large_usd as i128)
                 );
                 let mut head = String::from("| Capture \\ Impact |");
@@ -3307,10 +3567,99 @@ fn frontier(
                     cells,
                     selection_bias_warn: bias_warn,
                 });
+
+                // Break-Even Leakage Table for the primary decrypt delay (35 ms or first non-zero)
+                if dec == 35 || (args.decrypt.len() == 1 && dec == args.decrypt[0]) {
+                    let obs_exp_ppm = full[id].cancel_batch_exp_ppm();
+                    let exp_cols: [(String, i128); 4] = [
+                        (format!("Cancel-Batch ({})", fmt_ppm_pct1(obs_exp_ppm)), obs_exp_ppm),
+                        ("50.0% Exposed".to_string(), 500_000),
+                        ("75.0% Exposed".to_string(), 750_000),
+                        ("100.0% Exposed (All)".to_string(), 1_000_000),
+                    ];
+                    let e0 = base_econ(args);
+                    let pairs: [(i128, i128); 5] = [
+                        (100_000, 50),
+                        (100_000, 100),
+                        (250_000, 100),
+                        (500_000, 100),
+                        (500_000, 200),
+                    ];
+                    emit!(
+                        rep,
+                        "\n#### Break-Even Residual Leakage `eff_leak*` (where All-In(D, dec {}ms) == All-In(B, {}ms))",
+                        dec, bw
+                    );
+                    emit!(
+                        rep,
+                        "Dywe is cheaper for takers (`D < B`) whenever actual residual leakage `eff_leak < eff_leak*` (note `eff_leak <= capture` by definition; values `>= capture` mean D stays cheaper for any `leak <= capture`)."
+                    );
+                    emit!(
+                        rep,
+                        "| Ambient Capture / Impact | {} | {} | {} | {} |",
+                        exp_cols[0].0, exp_cols[1].0, exp_cols[2].0, exp_cols[3].0
+                    );
+                    emit!(rep, "|---|---:|---:|---:|---:|");
+
+                    let mut tbody_be = String::new();
+                    for &(cap, imp) in pairs.iter() {
+                        let row_lbl = format!("{}% / {} bp", cap / 10_000, fmt_bps(imp * Q));
+                        let mut md_row = format!("| {} |", row_lbl);
+                        tbody_be.push_str(&format!("<tr><td><strong>{}</strong></td>", html_escape(&row_lbl)));
+                        for &(_, exp_ppm) in exp_cols.iter() {
+                            let val_s = match breakeven_leak_ppm(&full[ib], &full[id], &e0, cap, imp, 500_000, exp_ppm) {
+                                Some(be) => {
+                                    if be > 1_000_000 {
+                                        ">100.0%".to_string()
+                                    } else if be < 0 {
+                                        "<0.0% (never)".to_string()
+                                    } else {
+                                        fmt_ppm_pct1(be)
+                                    }
+                                }
+                                None => "n/a".to_string(),
+                            };
+                            md_row.push_str(&format!(" {} |", val_s));
+                            tbody_be.push_str(&format!("<td>{}</td>", html_escape(&val_s)));
+                        }
+                        tbody_be.push_str("</tr>\n");
+                        emit!(rep, "{}", md_row);
+                    }
+
+                    be_html = format!(
+                        r#"<div class="table-card" style="margin-bottom: 20px;">
+                            <h2>Break-Even Residual Leakage eff_leak* (All-In(D, {}ms) == All-In(B, {}ms))</h2>
+                            <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
+                                Maximum tolerable effective leakage rate in Regime D before All-In(D) reaches parity with Regime B (50% MM MEV share). Dywe is cheaper whenever <code>eff_leak &lt; eff_leak*</code>.
+                            </p>
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>Ambient Capture / Impact</th>
+                                        <th>{}</th>
+                                        <th>{}</th>
+                                        <th>{}</th>
+                                        <th>{}</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {}
+                                </tbody>
+                            </table>
+                        </div>"#,
+                        dec,
+                        bw,
+                        html_escape(&exp_cols[0].0),
+                        html_escape(&exp_cols[1].0),
+                        html_escape(&exp_cols[2].0),
+                        html_escape(&exp_cols[3].0),
+                        tbody_be
+                    );
+                }
             }
         }
     }
-    html_grids
+    (html_grids, be_html)
 }
 
 fn render_mech_rows_html(specs: &[Spec], totals: &[Agg], shift: i64, args: &Args) -> String {
@@ -3326,7 +3675,7 @@ fn render_mech_rows_html(specs: &[Spec], totals: &[Agg], shift: i64, args: &Args
         match evaluate(a, sp.regime, &e0) {
             None => {
                 rows.push_str(&format!(
-                    "<tr{}><td>{}</td><td colspan=\"13\">n/a</td></tr>\n",
+                    "<tr{}><td>{}</td><td colspan=\"14\">n/a</td></tr>\n",
                     tr_cls, label
                 ));
             }
@@ -3335,10 +3684,11 @@ fn render_mech_rows_html(specs: &[Spec], totals: &[Agg], shift: i64, args: &Args
                 let m1 = a.mm_w[1] * Q / a.mm_n;
                 let m2 = a.mm_w[2] * Q / a.mm_n;
                 rows.push_str(&format!(
-                    "<tr{}><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><strong>{}</strong></td><td>{}/{}</td><td>{}</td><td>{}</td></tr>\n",
+                    "<tr{}><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><strong>{}</strong></td><td>{}/{}</td><td>{}</td><td>{}</td></tr>\n",
                     tr_cls,
                     label,
                     fmt_usd(a.mm_n),
+                    fmt_usd(a.tk_n),
                     fmt_bps(m0),
                     fmt_bps(m1),
                     fmt_bps(m2),
@@ -3421,7 +3771,8 @@ fn mech_table_html(title: &str, rows_html: &str, wait_col_hdr: &str) -> String {
                     <thead>
                         <tr>
                             <th>Architecture Regime</th>
-                            <th>MM Total Vol</th>
+                            <th>MM Vol (incl. Probe)</th>
+                            <th>Hist Taker Vol</th>
                             <th>Markout 0ms</th>
                             <th>Markout 100ms</th>
                             <th>Markout 1s</th>
@@ -3540,6 +3891,33 @@ fn format_book_diag(diag: &BookTickerDiag) -> String {
     )
 }
 
+fn format_taker_diag(diag: &RawTakerDiag, large_usd: i64) -> String {
+    if diag.raw_rows == 0 {
+        return String::new();
+    }
+    let raw_sh = if diag.raw_vol_usd > 0 {
+        diag.raw_large_vol_usd * 1000 / diag.raw_vol_usd
+    } else {
+        0
+    };
+    let mrg_sh = if diag.merged_vol_usd > 0 {
+        diag.merged_large_vol_usd * 1000 / diag.merged_vol_usd
+    } else {
+        0
+    };
+    format!(
+        "Historical taker flow diagnostics (pure exchange volume {}, threshold >={}): unmerged raw rows = {} ({} large rows, {} of USD volume); 1-ms directional bursts (`merge_taker`) = {} ({} large bursts, {} of USD volume).",
+        fmt_usd(diag.raw_vol_usd),
+        fmt_usd(large_usd as i128),
+        diag.raw_rows,
+        diag.raw_large_rows,
+        fmt_permille(raw_sh),
+        diag.merged_bursts,
+        diag.merged_large_bursts,
+        fmt_permille(mrg_sh)
+    )
+}
+
 fn generate_html_report(
     output_path: &Path,
     args: &Args,
@@ -3550,11 +3928,13 @@ fn generate_html_report(
     total_taker_orders: usize,
     proxy_diag: &ProxyDiag,
     book_diag: &BookTickerDiag,
+    taker_diag: &RawTakerDiag,
     nblocks: usize,
     specs: &[Spec],
     per_sym: &[Vec<Vec<Agg>>],
     full: &[Agg],
     html_grids: &[FrontierGrid],
+    breakeven_leak_html: &str,
     sign_check_text: &str,
 ) -> Result<(), String> {
     let file = File::create(output_path)
@@ -3611,6 +3991,7 @@ fn generate_html_report(
         opex_sub: args.opex_sub,
         horizon: 2,
         wait_cohort: args.wait_cohort,
+        d_exposure: args.d_exposure_mode,
     };
     let mid_scenario_delta = delta_all_in(&full[ib], &full[id35], &e_mid)
         .map_or("n/a".to_string(), |d| format!("{} bps", fmt_bps_signed(d)));
@@ -3674,6 +4055,8 @@ fn generate_html_report(
 
     let rebate_bps = fmt_bps(args.rebate_sub * Q);
     let opex_bps = fmt_bps(args.opex_sub * Q);
+    let req_bps = fmt_bps((args.requote_thr_sub as i128) * Q);
+    let snp_bps = fmt_bps((args.sniper_thr_sub as i128) * Q);
     let large_usd_str = fmt_usd(args.large_usd as i128);
 
     let mut frontier_cards_html = String::new();
@@ -3706,8 +4089,8 @@ fn generate_html_report(
                 <h2>Break-Even Frontier: All-In(D) &minus; All-In(B) (bps) &mdash; Decrypt {}ms | React {}ms</h2>
                 {}
                 <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
-                    Assumptions: MM MEV Loss Share = 50%, Side-Channel Leak = 10% (0% when capture = 0%), Maker Rebate = +{} bps revenue, Hedge OpEx = {} bps, Large Threshold = {}, B Order = <code>{}</code>, D Order = <code>{}</code>, Pending = <code>{}</code>, Source = <code>{}</code>, Wait = <code>{}</code>.<br>
-                    <strong>D&lt;B</strong> (purple): Dywe cheaper for takers (95% CI &lt; 0); <strong>B&lt;D</strong> (amber): Regime B cheaper; <strong>~</strong>: statistically indistinguishable.
+                    Assumptions: MM MEV Share = 50%, Leak = 10% (<code>eff_leak = min(leak, capture)</code>), D Exposure = <code>{}</code>, Rebate = {} bp (paid to MM), OpEx = {} bp, Burst Threshold = {}, B/D Order = <code>{}/{}</code>, Pending = <code>{}</code>, Source = <code>{}</code>, Wait = <code>{}</code>.<br>
+                    <strong>D&lt;B</strong> (purple): Dywe cheaper (95% CI &lt; 0); <strong>B&lt;D</strong> (amber): Regime B cheaper; <strong>~</strong>: indistinguishable.
                     <strong>Every cell with capture &gt; 0% is a parameterized scenario output, not a measurement.</strong>
                 </p>
                 <table>
@@ -3729,6 +4112,7 @@ fn generate_html_report(
             fg.decrypt_ms,
             fg.react_ms,
             bias_html,
+            args.d_exposure_mode.as_str(),
             rebate_bps,
             opex_bps,
             large_usd_str,
@@ -3748,6 +4132,9 @@ fn generate_html_report(
     };
 
     let mut banner_parts: Vec<String> = Vec::new();
+    if taker_diag.raw_rows > 0 {
+        banner_parts.push(html_escape(&format_taker_diag(taker_diag, args.large_usd)));
+    }
     if book_diag.files_loaded > 0 {
         banner_parts.push(html_escape(&format_book_diag(book_diag)));
     }
@@ -3775,7 +4162,7 @@ fn generate_html_report(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dywe Protocol — Causal Microstructure &amp; Break-Even Ablation Report (v0.3.4)</title>
+    <title>Dywe Protocol — Causal Microstructure &amp; Break-Even Ablation Report ({ver})</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <style>
         :root {{
@@ -3897,22 +4284,22 @@ fn generate_html_report(
 <body>
 <div class="container">
     <div class="top-bar">
-        <span class="brand-pill"><span class="brand-dot"></span>DYWE PROTOCOL // CAUSAL MICROSTRUCTURE RESEARCH (v0.3.4)</span>
-        <span class="engine-tag">B={b_order} &bull; D={d_order} &bull; PENDING={pending_pol} &bull; SRC={mid_src} &bull; WAIT={wait_cohort} &bull; DETERMINISTIC i128</span>
+        <span class="brand-pill"><span class="brand-dot"></span>DYWE PROTOCOL // CAUSAL MICROSTRUCTURE RESEARCH ({ver})</span>
+        <span class="engine-tag">B={b_order} &bull; D={d_order} &bull; D-EXP={d_exp} &bull; REQ={req_bps}bp &bull; PENDING={pending_pol} &bull; DETERMINISTIC i128</span>
     </div>
 
     <header>
         <div class="title-group">
             <h1>DYWE EXCHANGE &mdash; CAUSAL MICROSTRUCTURE &amp; BREAK-EVEN ABLATION STUDY</h1>
-            <p>Scenario-Based Counterfactual Replay on Binance Futures flow ({syms}, {start} + {days}d | {nblocks} Joint {bh}h Bootstrap Blocks | Rebate +{rebate_bps}bp, OpEx {opex_bps}bp)</p>
+            <p>Scenario-Based Counterfactual Replay on Binance Futures flow ({syms}, {start} + {days}d | {nblocks} Joint {bh}h Bootstrap Blocks | Rebate {rebate_bps}bp to MM, OpEx {opex_bps}bp)</p>
         </div>
         <div class="meta-badges">
             <span class="badge">Pair-Days: <strong>{days_ok}/{total_tasks}</strong></span>
             <span class="badge">Mid Ticks: <strong>{total_mid_ticks}</strong></span>
-            <span class="badge">Taker Flow: <strong>{total_taker_orders}</strong></span>
-            <span class="badge">B/D Order: <strong>{b_order}/{d_order}</strong></span>
+            <span class="badge">1-ms Bursts: <strong>{total_taker_orders}</strong></span>
+            <span class="badge">Requote Thr: <strong>{req_bps}bp</strong></span>
+            <span class="badge">D Exposure: <strong>{d_exp}</strong></span>
             <span class="badge">Pending: <strong>{pending_pol}</strong></span>
-            <span class="badge">Wait: <strong>{wait_cohort}</strong></span>
             <span class="badge">Source: <strong>{data_source_badge}</strong></span>
         </div>
     </header>
@@ -3936,7 +4323,7 @@ fn generate_html_report(
             <span class="kpi-pill">All-In Taker Cost delta (wait={wait_cohort})</span>
         </div>
         <div class="kpi-card">
-            <div class="label">Scenario &Delta; All-In (25% capture, 1 bp, 10% leak)</div>
+            <div class="label">Scenario &Delta; All-In (25% cap, 1bp, 10% leak, exp={d_exp})</div>
             <div class="value">{mid_scenario_delta}</div>
             <span class="kpi-pill">Scenario output &mdash; not a measurement</span>
         </div>
@@ -3961,7 +4348,8 @@ fn generate_html_report(
             <thead>
                 <tr>
                     <th>Architecture Regime</th>
-                    <th>MM Total Vol</th>
+                    <th>MM Vol (incl. Probe)</th>
+                    <th>Hist Taker Vol</th>
                     <th>Markout 0ms</th>
                     <th>Markout 100ms</th>
                     <th>Markout 1s</th>
@@ -3981,7 +4369,7 @@ fn generate_html_report(
             </tbody>
         </table>
         <p style="margin-top: 10px; font-size: 11.5px; color: var(--text-muted);">
-            <strong>Identity (MEV = 0):</strong> <code>[1] Spread Paid + [2] Taker Stale + [3] Wait = All-In Net</code> (wait cohort: <code>{wait_cohort}</code>).
+            <strong>Identity (MEV = 0):</strong> <code>[1] Spread Paid + [2] Taker Stale + [3] Wait = All-In Net</code> (wait cohort: <code>{wait_cohort}</code>; requote_thr: <code>{req_bps}bp</code>, sniper_thr: <code>{snp_bps}bp</code>).
             <strong>Adverse selection check (Regime A, 1s markout):</strong> {sign_check_text}
         </p>
     </div>
@@ -4004,7 +4392,7 @@ fn generate_html_report(
                     <th>Taker 1s Markout</th>
                     <th>StaleSnipe 1s Markout</th>
                     <th>LateSnipe 1s Markout</th>
-                    <th>Large Vol % (&ge;{large_usd_str})</th>
+                    <th>1-ms Burst Vol % (&ge;{large_usd_str})</th>
                     <th>Cancel-Batch Large %</th>
                 </tr>
             </thead>
@@ -4016,20 +4404,19 @@ fn generate_html_report(
 
     {per_sym_sections_html}
 
-    <h2 style="font-size: 18px; margin: 26px 0 12px 0; color: #ffffff;">Phase 2: Break-Even Frontier Across MEV Extraction Scenarios</h2>
+    <h2 style="font-size: 18px; margin: 26px 0 12px 0; color: #ffffff;">Phase 2: Break-Even Frontier &amp; Break-Even Leakage Across MEV Scenarios</h2>
     {frontier_cards_html}
+    {breakeven_leak_html}
 
     {calibration_html}
 
     <div class="bounds-box">
         <h3>Methodological Scope &amp; Statistical Boundaries</h3>
         <ul>
-            <li><strong>Regime D timeline:</strong> all order fields (New ALO, Cancel, Taker) are threshold-encrypted pre-commit, commit at <code>batch_close</code>, complete threshold decryption at <code>clear_ns = batch_close + decrypt_ms</code>, and clear in matching-engine memory using <code>{d_order}</code> ordering. Windows: B {b_win}ms ({b_order}), C {c_win}ms, D {d_win}ms ({d_order}).</li>
-            <li><strong>Simulated latency-arb probe:</strong> StaleSnipe hits are generated by a deterministic parameterized probe (2 bps trigger, 2 ms reaction, ${sniper_clip} clip; configurable via <code>--sniper-clip</code>).</li>
-            <li><strong>Selection bias under drop:</strong> when <code>pending=drop</code>, takers arriving during an MM cancel-replace gap are excluded from both MM markout and All-In Net; compare <code>Dropped Takers (USD%)</code> before comparing costs across regimes.</li>
-            <li><strong>Single-denominator additivity:</strong> <code>--wait-cohort all</code> (default) computes waiting drift over all executed takers (<code>tk_n</code>), matching the denominator of Spread Paid, Taker Stale, and MEV Taker.</li>
-            <li><strong>95% bootstrap CI:</strong> joint {bh}-hour block resampling across {sym1_name} and {sym2_name} ({nblocks} blocks). It reflects drift variance under fixed scenario assumptions and does not cover parameter uncertainty (capture, impact, leak, reaction times, windows).</li>
-            <li><strong>Other limits:</strong> exogenous taker flow (invariant to spread width), one representative MM clearing the entire exchange flow, absolute <code>s*net</code> levels not directly comparable to real Binance tick spreads, and limited sample windows.</li>
+            <li><strong>Regime D timeline &amp; exposure:</strong> orders commit at <code>batch_close</code>, decrypt at <code>clear_ns = batch_close + decrypt_ms</code>, and clear using <code>{d_order}</code> ordering. Windows: B {b_win}ms ({b_order}), C {c_win}ms, D {d_win}ms ({d_order}). Exposure mode: <code>{d_exp}</code>.</li>
+            <li><strong>MM requote &amp; sniper probe parameters:</strong> representative MM requotes when mid moves &ge;<code>{req_bps} bp</code> (<code>--requote-thr-sub</code>); synthetic probe triggers at &ge;<code>{snp_bps} bp</code> (<code>--sniper-thr-sub</code>) with 2 ms reaction and ${sniper_clip} clip (<code>--sniper-clip</code>).</li>
+            <li><strong>1-ms burst aggregation:</strong> <code>merge_taker</code> aggregates same-millisecond, same-direction executions; inspect Raw Taker Diagnostics above for the unmerged lower bound.</li>
+            <li><strong>95% bootstrap CI:</strong> joint {bh}-hour block resampling ({nblocks} blocks). Quantifies drift sampling variance under fixed scenario assumptions and does not account for volatility autocorrelation or parameter uncertainty.</li>
         </ul>
     </div>
 </div>
@@ -4104,6 +4491,7 @@ fn generate_html_report(
 </body>
 </html>
 "#,
+        ver = VERSION,
         syms = html_escape(&args.symbols.join(", ")),
         start = html_escape(&args.start),
         days = args.days,
@@ -4115,12 +4503,14 @@ fn generate_html_report(
         total_taker_orders = total_taker_orders,
         b_order = args.b_batch_order.as_str(),
         d_order = args.d_batch_order.as_str(),
+        d_exp = args.d_exposure_mode.as_str(),
         pending_pol = args.pending_policy.as_str(),
-        mid_src = args.mid_source.as_str(),
         wait_cohort = args.wait_cohort.as_str(),
         wait_col_hdr = html_escape(wait_col_hdr),
         rebate_bps = rebate_bps,
         opex_bps = opex_bps,
+        req_bps = req_bps,
+        snp_bps = snp_bps,
         large_usd_str = html_escape(&large_usd_str),
         sniper_clip = args.sniper_clip_usd,
         data_source_badge = data_source_badge,
@@ -4145,6 +4535,7 @@ fn generate_html_report(
         ratio_html = ratio_html,
         per_sym_sections_html = per_sym_sections_html,
         frontier_cards_html = frontier_cards_html,
+        breakeven_leak_html = breakeven_leak_html,
         calibration_html = calibration_html,
         btc_a = btc_a,
         btc_b = btc_b,
@@ -4195,10 +4586,14 @@ fn main() {
     let specs = build_specs(&args);
     let mut rep = String::new();
 
-    emit!(rep, "# Dywe Microstructure Ablation — Scenario-Based Causal Backtest (v0.3.4)");
     emit!(
         rep,
-        "Window: {} + {}d | Pairs: {} | Bootstrap Block: {}h ({} blocks) | Runs per (Pair, Day): {} | B {}ms ({}), D {}ms ({}), FBA {}ms | pending={} | src={} | mid={} | wait={} | sniper_clip={} | rebate=+{}bp, opex={}bp, large>={} | placebo shifts (s): {:?}",
+        "# Dywe Microstructure Ablation — Scenario-Based Causal Backtest ({})",
+        VERSION
+    );
+    emit!(
+        rep,
+        "Window: {} + {}d | Pairs: {} | Bootstrap Block: {}h ({} blocks) | Runs per (Pair, Day): {} | B {}ms ({}), D {}ms ({}, exp={}), FBA {}ms | requote_thr={}bp, sniper_thr={}bp | pending={} | src={} | mid={} | wait={} | sniper_clip={} | rebate={}bp (paid to MM), opex={}bp, large>={} | placebo shifts (s): {:?}",
         args.start,
         args.days,
         args.symbols.join(","),
@@ -4209,7 +4604,10 @@ fn main() {
         args.b_batch_order.as_str(),
         args.window_ms,
         args.d_batch_order.as_str(),
+        args.d_exposure_mode.as_str(),
         args.fba_window_ms,
+        fmt_bps((args.requote_thr_sub as i128) * Q),
+        fmt_bps((args.sniper_thr_sub as i128) * Q),
         args.pending_policy.as_str(),
         args.mid_source.as_str(),
         args.mid_mode.as_str(),
@@ -4261,6 +4659,7 @@ fn main() {
     let mut total_taker_orders = 0usize;
     let mut total_proxy_diag = ProxyDiag::default();
     let mut total_book_diag = BookTickerDiag::default();
+    let mut total_taker_diag = RawTakerDiag::default();
 
     let res_vec = results.into_inner().unwrap_or_default();
     for (i, slot) in res_vec.into_iter().enumerate() {
@@ -4276,6 +4675,7 @@ fn main() {
                     total_taker_orders += r.taker_orders;
                     total_proxy_diag.merge(&r.proxy_diag);
                     total_book_diag.merge(&r.book_diag);
+                    total_taker_diag.merge(&r.taker_diag);
                     if r.reconstructed {
                         days_reconstructed += 1;
                     }
@@ -4302,13 +4702,20 @@ fn main() {
             emit!(rep, "- {}", s);
         }
     }
+    if total_taker_diag.raw_rows > 0 {
+        emit!(
+            rep,
+            "\n**TAKER FLOW DIAGNOSTICS:** {}",
+            format_taker_diag(&total_taker_diag, args.large_usd)
+        );
+    }
     if total_book_diag.files_loaded > 0 {
-        emit!(rep, "\n**DATA DIAGNOSTICS:** {}", format_book_diag(&total_book_diag));
+        emit!(rep, "\n**BOOKTICKER DIAGNOSTICS:** {}", format_book_diag(&total_book_diag));
     }
     if days_reconstructed > 0 {
         emit!(
             rep,
-            "\n**NOTE:** {} pair-days used a trade-derived midpoint proxy (`--mid-source {}`, mode `{}`). {}",
+            "\n**PROXY NOTE:** {} pair-days used a trade-derived midpoint proxy (`--mid-source {}`, mode `{}`). {}",
             days_reconstructed,
             args.mid_source.as_str(),
             args.mid_mode.as_str(),
@@ -4422,13 +4829,15 @@ fn main() {
         }
     }
 
-    emit!(rep, "\n## Phase 2: Break-Even Frontier (MEV Scenario Assumptions)");
+    emit!(rep, "\n## Phase 2: Break-Even Frontier & Break-Even Leakage (MEV Scenario Assumptions)");
     emit!(
         rep,
-        "All cells with capture above 0% are parameterized scenario outputs (`capture × impact × mm_loss_share × leak`), not measurements. At `capture = 0%`, MEV extraction is strictly zero regardless of `leak_ppm`. `breakeven.csv` contains the full 6×5×4×4 grid per decryption delay."
+        "All cells with capture above 0% are parameterized scenario outputs (`capture × impact × mm_loss_share × eff_leak`, where `eff_leak = min(leak, capture)`), not measurements. Exposure mode for Regime D: `{}`. `breakeven.csv` contains the full 6×5×4×4 grid per decryption delay.",
+        args.d_exposure_mode.as_str()
     );
     let mut csv = String::new();
-    let html_grids = frontier(&mut rep, &mut csv, &specs, &full, &boot, &args);
+    let (html_grids, breakeven_leak_html) =
+        frontier(&mut rep, &mut csv, &specs, &full, &boot, &args);
 
     emit!(rep, "\n## External Venue Documentation & Parameterized Assumptions (NOT simulation inputs)");
     for (topic, statement, source) in EXTERNAL_CALIBRATION_NOTES.iter() {
@@ -4441,13 +4850,12 @@ fn main() {
     }
 
     emit!(rep, "\n## Methodological Boundaries & Scope");
-    emit!(rep, "- Regime D timeline: all order fields (New ALO, Cancel, Taker) are threshold-encrypted pre-commit, commit at `batch_close`, complete threshold decryption at `clear_ns = batch_close + decrypt_ms`, and clear in matching-engine memory using `--d-batch-order {}`.", args.d_batch_order.as_str());
-    emit!(rep, "- Regime B uses `--b-batch-order {}` (`hl` = New/post-only -> Cancel -> Taker/Sniper; `cancel-first` = Cancel -> New/Taker/Sniper).", args.b_batch_order.as_str());
-    emit!(rep, "- Single-denominator All-In Net: `--wait-cohort {}` (`all` uses total executed taker volume `tk_n` across all 4 components; `large` isolates waiting drift of large orders >= {}).", args.wait_cohort.as_str(), fmt_usd(args.large_usd as i128));
-    emit!(rep, "- Simulated latency-arb probe: StaleSnipe hits are generated by a parameterized probe (`--sniper-clip`, default $25,000); set `--sniper-clip 0` to isolate historical taker flow.");
-    emit!(rep, "- Under `pending=drop`, dropped takers are excluded from both MM markout and All-In Net; inspect `Dropped Takers (USD%)` and selection-bias warnings before comparing costs.");
-    emit!(rep, "- 95% CI reflects drift variance across multi-hour blocks under FIXED scenario assumptions; parameter uncertainty (capture, impact, leak, reaction times, windows) is not covered.");
-    emit!(rep, "- Exogenous taker flow (invariant to spread width); one representative MM clears the full exchange flow; absolute `s*net` levels are model-derived and not directly comparable to real Binance tick spreads.");
+    emit!(rep, "- Regime D timeline: orders commit at `batch_close`, decrypt at `clear_ns = batch_close + decrypt_ms`, and clear using `--d-batch-order {}` (exposure mode: `--d-exposure-mode {}`).", args.d_batch_order.as_str(), args.d_exposure_mode.as_str());
+    emit!(rep, "- MM requote threshold: `--requote-thr-sub {}` ({} bp); synthetic sniper probe threshold: `--sniper-thr-sub {}` ({} bp), clip: `{}` (`--sniper-clip 0` disables probe).", args.requote_thr_sub, fmt_bps((args.requote_thr_sub as i128) * Q), args.sniper_thr_sub, fmt_bps((args.sniper_thr_sub as i128) * Q), fmt_usd(args.sniper_clip_usd as i128));
+    emit!(rep, "- Single-denominator All-In Net: `--wait-cohort {}` (`all` uses total executed taker volume `tk_n` across all 4 components).", args.wait_cohort.as_str());
+    emit!(rep, "- Under `pending=drop`, dropped takers are excluded from both MM markout and All-In Net; inspect `Dropped Takers (USD%)` (0.001% precision) before comparing costs.");
+    emit!(rep, "- 95% CI reflects block-resampling drift variance under fixed scenario assumptions; volatility autocorrelation and parameter uncertainty are not covered.");
+    emit!(rep, "- Exogenous taker flow; single representative MM; model-derived `s*net` is not directly comparable to real exchange tick spreads.");
 
     let out_dir = Path::new(&args.out_dir);
     let _ = std::fs::create_dir_all(out_dir);
@@ -4468,11 +4876,13 @@ fn main() {
         total_taker_orders,
         &total_proxy_diag,
         &total_book_diag,
+        &total_taker_diag,
         nblocks,
         &specs,
         &per_sym,
         &full,
         &html_grids,
+        &breakeven_leak_html,
         &sign_check_summary,
     ) {
         eprintln!("Failed to write ablation_report.html: {}", e);
