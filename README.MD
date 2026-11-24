@@ -119,26 +119,26 @@ Every historical mid-price update and directional taker burst is replayed across
 For every regime and scenario, the engine solves for the zero-profit competitive equilibrium half-spread `s*net` (configurable via `--rebate-sub`, default `50` = `0.50 bps` rebate paid to MM; `--opex-sub`, default `30` = `0.30 bps` hedging OpEx):
 
 $$
-s^*_{\text{net}} = \max\Big(0,\; -\text{Markout}_{1\text{s}} + \text{MEV}_{\text{MM}} - \text{Rebate} + \text{OpEx}\Big)
+s^*_{\text{net}} = \max\Big(0,\enspace -\text{Markout}_{1\text{s}} + \text{MEV}_{\text{MM}} - \text{Rebate} + \text{OpEx}\Big)
 $$
 
 Under `--wait-cohort all` (default), all four components of **All-In Net Cost** share a single volume denominator (`tk_n`), guaranteeing exact linear additivity:
 
 $$
 \text{All-In Net} =
-\underbrace{[1]\;\text{Spread Paid}}_{\text{effective } s^*_{\text{net}}}
+\underbrace{\text{[1] Spread Paid}}_{\text{effective } s^*_{\text{net}}}
 +
-\underbrace{[2]\;\text{Taker Stale}}_{\text{quote staleness}}
+\underbrace{\text{[2] Taker Stale}}_{\text{quote staleness}}
 +
-\underbrace{[3]\;\text{Wait (All)}}_{\text{batch/decrypt drift}}
+\underbrace{\text{[3] Wait (All)}}_{\text{batch/decrypt drift}}
 +
-\underbrace{[4]\;\text{MEV}_{\text{Taker}}}_{\text{sandwich impact}}
+\underbrace{\text{[4] MEV}_{\text{Taker}}}_{\text{sandwich impact}}
 $$
 
 And the **break-even residual leakage** `eff_leak*` (where `All-In(D) == All-In(B)`) for a given ambient capture rate, per-order impact, and Regime D exposure fraction `exp` is solved analytically in `breakeven_leak_ppm()`:
 
 $$
-\text{eff\_leak}^* =
+\text{eff\textunderscore leak}^* =
 \frac{\text{MEV}_B(\text{capture}, \text{impact}) - \Delta_0}
 {\text{UnitMEV}_D(\text{impact}, \text{exp})},
 \qquad
